@@ -486,6 +486,7 @@ a { text-decoration: none; color: inherit; }
 }
 .stat-change.up { color: var(--green); background: var(--green-light); }
 .stat-change.down { color: var(--red); background: var(--red-light); }
+.stat-change.neutral { color: var(--text-secondary); background: var(--bg-surface-2); }
 .stat-trend { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
 
 .sparkline-wrap { margin-top: 14px; height: 36px; }
@@ -748,6 +749,14 @@ a { text-decoration: none; color: inherit; }
 .player-name { font-size: 13px; font-weight: 500; }
 .player-server { font-size: 11.5px; color: var(--text-muted); }
 .player-time { font-size: 11.5px; color: var(--text-muted); font-family: 'DM Mono', monospace; white-space: nowrap; }
+
+/* ===== EMPTY STATE ===== */
+.empty-state {
+  color: var(--text-muted);
+  font-size: 12.5px;
+  text-align: center;
+  padding: 20px 0;
+}
 
 /* ===== TAB ===== */
 .tabs { display: flex; gap: 2px; padding: 4px; background: var(--bg-surface-2); border-radius: var(--radius-sm); }

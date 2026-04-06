@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import Chart from 'chart.js/auto'
 import Icon from './components/Icon'
-import { createDefaultDashboardData } from './data/defaultDashboard'
+import { createEmptyDashboardData } from './data/defaultDashboard'
 import { dashboardApi } from './services/dashboardApi'
 
-const DEFAULT_DASHBOARD = createDefaultDashboardData()
+const EMPTY_DASHBOARD = createEmptyDashboardData()
 
 function getChartColors(theme) {
   const dark = theme === 'dark'
@@ -25,6 +25,10 @@ function formatCurrentTime() {
     second: '2-digit',
     hour12: false,
   })
+}
+
+function EmptyState({ message }) {
+  return <div className="empty-state">{message}</div>
 }
 
 function Sparkline({ id, data, color }) {
@@ -397,37 +401,51 @@ function TableActionButtons({ actions, row, index, onConsole, onRestart, onStart
 }
 
 function App() {
-  const [dashboard, setDashboard] = useState(DEFAULT_DASHBOARD)
+  const [dashboard, setDashboard] = useState(EMPTY_DASHBOARD)
   const [theme, setTheme] = useState('light')
   const [collapsed, setCollapsed] = useState(false)
   const [currentTime, setCurrentTime] = useState(() => formatCurrentTime())
   const [globalSearch, setGlobalSearch] = useState('')
   const [tableSearch, setTableSearch] = useState('')
-  const [gameFilter, setGameFilter] = useState(DEFAULT_DASHBOARD.table.gameOptions[0])
-  const [statusFilter, setStatusFilter] = useState(DEFAULT_DASHBOARD.table.statusOptions[0])
-  const [activeTab, setActiveTab] = useState(DEFAULT_DASHBOARD.playersOverview.activeTab)
-  const [livePlayers, setLivePlayers] = useState(
-    DEFAULT_DASHBOARD.stats.find((stat) => stat.label === '在线玩家')?.value ?? '4,892',
-  )
+  const [gameFilter, setGameFilter] = useState(EMPTY_DASHBOARD.table.gameOptions[0])
+  const [statusFilter, setStatusFilter] = useState(EMPTY_DASHBOARD.table.statusOptions[0])
+  const [activeTab, setActiveTab] = useState(EMPTY_DASHBOARD.playersOverview.activeTab)
+  const [isLoading, setIsLoading] = useState(true)
 
   useEffect(() => {
     let cancelled = false
 
-    async function loadDashboard() {
-      const payload = await dashboardApi.getDashboardData()
-      if (!cancelled) {
+    async function loadInitialDashboardData() {
+      setIsLoading(true)
+
+      try {
+        const payload = await dashboardApi.getDashboardData()
+        if (cancelled) {
+          return
+        }
+
         setDashboard(payload)
-        setActiveTab(payload.playersOverview.activeTab)
-        setGameFilter(payload.table.gameOptions[0])
-        setStatusFilter(payload.table.statusOptions[0])
-        const onlinePlayersStat = payload.stats.find((stat) => stat.label === '在线玩家')
-        if (onlinePlayersStat) {
-          setLivePlayers(onlinePlayersStat.value)
+        setActiveTab(payload.playersOverview.activeTab || payload.playersOverview.tabs[0] || '')
+        setGameFilter(payload.table.gameOptions[0] || '')
+        setStatusFilter(payload.table.statusOptions[0] || '')
+      } catch (error) {
+        console.error('加载仪表盘数据失败', error)
+        if (cancelled) {
+          return
+        }
+
+        setDashboard(createEmptyDashboardData())
+        setActiveTab(EMPTY_DASHBOARD.playersOverview.activeTab)
+        setGameFilter(EMPTY_DASHBOARD.table.gameOptions[0])
+        setStatusFilter(EMPTY_DASHBOARD.table.statusOptions[0])
+      } finally {
+        if (!cancelled) {
+          setIsLoading(false)
         }
       }
     }
 
-    loadDashboard()
+    loadInitialDashboardData()
 
     return () => {
       cancelled = true
@@ -449,27 +467,26 @@ function App() {
     }
   }, [])
 
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      setLivePlayers((currentValue) => {
-        const current = Number.parseInt(currentValue.replace(',', ''), 10)
-        const delta = Math.floor(Math.random() * 20) - 8
-        const next = Math.max(4600, Math.min(5200, current + delta))
-        return next.toLocaleString()
-      })
-    }, 3000)
-
-    return () => {
-      window.clearInterval(timer)
-    }
-  }, [])
-
-  const displayedStats = dashboard.stats.map((stat) =>
-    stat.label === '在线玩家' ? { ...stat, value: livePlayers } : stat,
-  )
+  const headerLiveLabel = isLoading ? '加载中' : dashboard.header.liveLabel
 
   const handleRefresh = async () => {
-    await dashboardApi.actions.onRefresh({ dashboard, filters: { globalSearch, tableSearch, gameFilter, statusFilter } })
+    setIsLoading(true)
+
+    try {
+      const payload = await dashboardApi.getDashboardData()
+      setDashboard(payload)
+      setActiveTab(payload.playersOverview.activeTab || payload.playersOverview.tabs[0] || '')
+      setGameFilter(payload.table.gameOptions[0] || '')
+      setStatusFilter(payload.table.statusOptions[0] || '')
+    } catch (error) {
+      console.error('刷新仪表盘数据失败', error)
+      setDashboard(createEmptyDashboardData())
+      setActiveTab(EMPTY_DASHBOARD.playersOverview.activeTab)
+      setGameFilter(EMPTY_DASHBOARD.table.gameOptions[0])
+      setStatusFilter(EMPTY_DASHBOARD.table.statusOptions[0])
+    } finally {
+      setIsLoading(false)
+    }
   }
 
   const handleAddServer = async () => {
@@ -572,7 +589,7 @@ function App() {
           </div>
           <div className="header-right">
             <span className="status-live" style={{ padding: '0 8px' }}>
-              <span className="status-live-dot"></span> {dashboard.header.liveLabel}
+              <span className="status-live-dot"></span> {headerLiveLabel}
             </span>
             <div className="divider-v"></div>
             <button className="icon-btn" title="告警" type="button">
@@ -624,7 +641,7 @@ function App() {
           </div>
 
           <div className="stats-grid">
-            {displayedStats.map((stat) => (
+            {dashboard.stats.map((stat) => (
               <div className={`stat-card ${stat.color}`} key={stat.label}>
                 <div className="stat-header">
                   <div className="stat-label">{stat.label}</div>
@@ -703,27 +720,35 @@ function App() {
                   </div>
                 </div>
                 <div className="donut-legend">
-                  {dashboard.distribution.labels.map((label, index) => (
-                    <div className="legend-item" key={label}>
-                      <div className="legend-dot" style={{ background: dashboard.distribution.colors[index] }}></div>
-                      <span className="legend-label">{label}</span>
-                      <span className="legend-val">{dashboard.distribution.values[index]}</span>
-                    </div>
-                  ))}
+                  {dashboard.distribution.labels.length > 0 ? (
+                    dashboard.distribution.labels.map((label, index) => (
+                      <div className="legend-item" key={label}>
+                        <div className="legend-dot" style={{ background: dashboard.distribution.colors[index] }}></div>
+                        <span className="legend-label">{label}</span>
+                        <span className="legend-val">{dashboard.distribution.values[index]}</span>
+                      </div>
+                    ))
+                  ) : (
+                    <EmptyState message="暂无游戏分布数据" />
+                  )}
                 </div>
               </div>
               <div style={{ borderTop: '1px solid var(--border)', paddingTop: '16px' }} className="progress-section">
-                {dashboard.nodeProgress.map((item) => (
-                  <div className="progress-item" key={item.name}>
-                    <div className="progress-meta">
-                      <span className="progress-name">{item.name}</span>
-                      <span className="progress-stat">{item.value}</span>
+                {dashboard.nodeProgress.length > 0 ? (
+                  dashboard.nodeProgress.map((item) => (
+                    <div className="progress-item" key={item.name}>
+                      <div className="progress-meta">
+                        <span className="progress-name">{item.name}</span>
+                        <span className="progress-stat">{item.value}</span>
+                      </div>
+                      <div className="progress-track">
+                        <div className="progress-fill" style={{ width: item.width, background: item.background }}></div>
+                      </div>
                     </div>
-                    <div className="progress-track">
-                      <div className="progress-fill" style={{ width: item.width, background: item.background }}></div>
-                    </div>
-                  </div>
-                ))}
+                  ))
+                ) : (
+                  <EmptyState message="暂无节点资源数据" />
+                )}
               </div>
             </div>
           </div>
@@ -774,45 +799,53 @@ function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {dashboard.table.rows.map((row, index) => (
-                      <tr key={row.name}>
-                        <td>
-                          <div className="server-name">
-                            <span className={`server-dot ${row.dot}`}></span>
-                            <div>
-                              <div className="server-name-text">{row.name}</div>
-                              <div className="server-ip">{row.ip}</div>
+                    {dashboard.table.rows.length > 0 ? (
+                      dashboard.table.rows.map((row, index) => (
+                        <tr key={row.name}>
+                          <td>
+                            <div className="server-name">
+                              <span className={`server-dot ${row.dot}`}></span>
+                              <div>
+                                <div className="server-name-text">{row.name}</div>
+                                <div className="server-ip">{row.ip}</div>
+                              </div>
                             </div>
-                          </div>
-                        </td>
-                        <td>
-                          <span className={row.game.className}>{row.game.label}</span>
-                        </td>
-                        <td>
-                          <span className={row.status.className}>{row.status.label}</span>
-                        </td>
-                        <td style={{ fontFamily: "'DM Mono',monospace", fontSize: '12.5px' }}>{row.players}</td>
-                        <td>
-                          <ProgressCell data={row.cpu} />
-                        </td>
-                        <td>
-                          <ProgressCell data={row.ram} />
-                        </td>
-                        <td>
-                          <span className={row.region.className}>{row.region.label}</span>
-                        </td>
-                        <td>
-                          <TableActionButtons
-                            actions={row.actions}
-                            row={row}
-                            index={index}
-                            onConsole={handleServerConsole}
-                            onRestart={handleServerRestart}
-                            onStart={handleServerStart}
-                          />
+                          </td>
+                          <td>
+                            <span className={row.game.className}>{row.game.label}</span>
+                          </td>
+                          <td>
+                            <span className={row.status.className}>{row.status.label}</span>
+                          </td>
+                          <td style={{ fontFamily: "'DM Mono',monospace", fontSize: '12.5px' }}>{row.players}</td>
+                          <td>
+                            <ProgressCell data={row.cpu} />
+                          </td>
+                          <td>
+                            <ProgressCell data={row.ram} />
+                          </td>
+                          <td>
+                            <span className={row.region.className}>{row.region.label}</span>
+                          </td>
+                          <td>
+                            <TableActionButtons
+                              actions={row.actions}
+                              row={row}
+                              index={index}
+                              onConsole={handleServerConsole}
+                              onRestart={handleServerRestart}
+                              onStart={handleServerStart}
+                            />
+                          </td>
+                        </tr>
+                      ))
+                    ) : (
+                      <tr>
+                        <td colSpan="8">
+                          <EmptyState message="暂无服务器数据" />
                         </td>
                       </tr>
-                    ))}
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -882,26 +915,30 @@ function App() {
                   </button>
                 </div>
                 <div className="activity-list">
-                  {dashboard.activities.map((activity, index) => (
-                    <div className="activity-item" key={`${activity.time}-${index}`}>
-                      <div className="activity-icon" style={activity.iconStyle}>
-                        <Icon name={activity.icon} width={14} height={14} strokeWidth={2.5} />
-                      </div>
-                      <div className="activity-content">
-                        <div className="activity-text">
-                          {activity.text.before}
-                          <strong>{activity.text.strong}</strong>
-                          {activity.text.after}
+                  {dashboard.activities.length > 0 ? (
+                    dashboard.activities.map((activity, index) => (
+                      <div className="activity-item" key={`${activity.time}-${index}`}>
+                        <div className="activity-icon" style={activity.iconStyle}>
+                          <Icon name={activity.icon} width={14} height={14} strokeWidth={2.5} />
                         </div>
-                        <div className="activity-meta">
-                          <span className={activity.badge.className} style={activity.badge.style}>
-                            {activity.badge.label}
-                          </span>
-                          <span className="activity-time">{activity.time}</span>
+                        <div className="activity-content">
+                          <div className="activity-text">
+                            {activity.text.before}
+                            <strong>{activity.text.strong}</strong>
+                            {activity.text.after}
+                          </div>
+                          <div className="activity-meta">
+                            <span className={activity.badge.className} style={activity.badge.style}>
+                              {activity.badge.label}
+                            </span>
+                            <span className="activity-time">{activity.time}</span>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  ))}
+                    ))
+                  ) : (
+                    <EmptyState message="暂无动态数据" />
+                  )}
                 </div>
               </div>
             </div>
@@ -916,18 +953,22 @@ function App() {
                 </span>
               </div>
               <div className="players-list">
-                {dashboard.topPlayers.map((player) => (
-                  <div className="player-row" key={player.name}>
-                    <div className="player-avatar" style={{ background: player.background }}>
-                      {player.initials}
+                {dashboard.topPlayers.length > 0 ? (
+                  dashboard.topPlayers.map((player) => (
+                    <div className="player-row" key={player.name}>
+                      <div className="player-avatar" style={{ background: player.background }}>
+                        {player.initials}
+                      </div>
+                      <div className="player-info">
+                        <div className="player-name">{player.name}</div>
+                        <div className="player-server">{player.server}</div>
+                      </div>
+                      <span className="player-time">{player.time}</span>
                     </div>
-                    <div className="player-info">
-                      <div className="player-name">{player.name}</div>
-                      <div className="player-server">{player.server}</div>
-                    </div>
-                    <span className="player-time">{player.time}</span>
-                  </div>
-                ))}
+                  ))
+                ) : (
+                  <EmptyState message="暂无在线玩家排行" />
+                )}
               </div>
             </div>
 
@@ -948,17 +989,21 @@ function App() {
               </div>
               <div className="card-body-sm">
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '8px' }}>
-                  {dashboard.networkHealth.regions.map((region) => (
-                    <div key={region.name}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12.5px', marginBottom: '5px' }}>
-                        <span style={{ color: 'var(--text-secondary)' }}>{region.name}</span>
-                        <span style={{ fontFamily: "'DM Mono',monospace", color: region.color, fontWeight: 600 }}>{region.value}</span>
+                  {dashboard.networkHealth.regions.length > 0 ? (
+                    dashboard.networkHealth.regions.map((region) => (
+                      <div key={region.name}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12.5px', marginBottom: '5px' }}>
+                          <span style={{ color: 'var(--text-secondary)' }}>{region.name}</span>
+                          <span style={{ fontFamily: "'DM Mono',monospace", color: region.color, fontWeight: 600 }}>{region.value}</span>
+                        </div>
+                        <div className="progress-track">
+                          <div className="progress-fill" style={{ width: region.width, background: region.color }}></div>
+                        </div>
                       </div>
-                      <div className="progress-track">
-                        <div className="progress-fill" style={{ width: region.width, background: region.color }}></div>
-                      </div>
-                    </div>
-                  ))}
+                    ))
+                  ) : (
+                    <EmptyState message="暂无网络健康数据" />
+                  )}
                   <div
                     style={{
                       borderTop: '1px solid var(--border)',

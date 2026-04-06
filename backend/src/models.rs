@@ -1,0 +1,548 @@
+use serde::Serialize;
+
+#[derive(Clone, Serialize)]
+pub struct HealthResponse {
+    pub status: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardResponse {
+    pub sidebar: Sidebar,
+    pub header: Header,
+    pub page: Page,
+    pub stats: Vec<StatCard>,
+    pub players_overview: PlayersOverview,
+    pub resource_chart: ResourceChart,
+    pub distribution: Distribution,
+    pub node_progress: Vec<NodeProgressItem>,
+    pub table: ServerTable,
+    pub quick_kpis: Vec<KpiCard>,
+    pub node_locations: NodeLocations,
+    pub activities: Vec<ActivityItem>,
+    pub top_players: Vec<TopPlayer>,
+    pub bandwidth: BandwidthChart,
+    pub network_health: NetworkHealth,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sidebar {
+    pub sections: Vec<SidebarSection>,
+    pub user: SidebarUser,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidebarSection {
+    pub label: String,
+    pub items: Vec<SidebarItem>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidebarItem {
+    pub label: String,
+    pub icon: String,
+    pub active: bool,
+    pub badge: Option<String>,
+    pub tooltip: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidebarUser {
+    pub initials: String,
+    pub name: String,
+    pub role: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Header {
+    pub search_placeholder: String,
+    pub search_shortcut: String,
+    pub live_label: String,
+    pub profile_initials: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Page {
+    pub title: String,
+    pub subtitle: String,
+    pub refresh_label: String,
+    pub add_server_label: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatCard {
+    pub label: String,
+    pub value: String,
+    pub change: String,
+    pub change_direction: String,
+    pub trend: String,
+    pub color: String,
+    pub icon: String,
+    pub sparkline_id: String,
+    pub sparkline_color: String,
+    pub sparkline_data: Vec<f64>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayersOverview {
+    pub title: String,
+    pub subtitle: String,
+    pub tabs: Vec<String>,
+    pub active_tab: String,
+    pub export_label: String,
+    pub labels: Vec<String>,
+    pub data: Vec<u32>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceChart {
+    pub title: String,
+    pub subtitle: String,
+    pub labels: Vec<String>,
+    pub cpu: Vec<u32>,
+    pub ram: Vec<u32>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Distribution {
+    pub title: String,
+    pub subtitle: String,
+    pub total: String,
+    pub total_label: String,
+    pub labels: Vec<String>,
+    pub values: Vec<u32>,
+    pub colors: Vec<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeProgressItem {
+    pub name: String,
+    pub value: String,
+    pub width: String,
+    pub background: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerTable {
+    pub title: String,
+    pub subtitle: String,
+    pub search_placeholder: String,
+    pub game_options: Vec<String>,
+    pub status_options: Vec<String>,
+    pub rows: Vec<ServerRow>,
+    pub pagination: Pagination,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerRow {
+    pub name: String,
+    pub ip: String,
+    pub dot: String,
+    pub game: Badge,
+    pub status: Badge,
+    pub players: String,
+    pub cpu: ProgressData,
+    pub ram: ProgressData,
+    pub region: Badge,
+    pub actions: Vec<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Badge {
+    pub label: String,
+    pub class_name: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProgressData {
+    pub width: String,
+    pub background: String,
+    pub value: String,
+    pub muted: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Pagination {
+    pub summary: String,
+    pub pages: Vec<String>,
+    pub active: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KpiCard {
+    pub label: String,
+    pub value: String,
+    pub sub: String,
+    pub color: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeLocations {
+    pub title: String,
+    pub nodes: Vec<MapNode>,
+    pub footer: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MapNode {
+    pub label: String,
+    pub background: String,
+    pub left: String,
+    pub top: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityItem {
+    pub icon: String,
+    pub icon_style: StyleDescriptor,
+    pub text: ActivityText,
+    pub badge: ActivityBadge,
+    pub time: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleDescriptor {
+    pub background: String,
+    pub color: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityText {
+    pub before: String,
+    pub strong: String,
+    pub after: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityBadge {
+    pub label: String,
+    pub class_name: String,
+    pub style: FontSizeStyle,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FontSizeStyle {
+    pub font_size: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopPlayer {
+    pub initials: String,
+    pub background: String,
+    pub name: String,
+    pub server: String,
+    pub time: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BandwidthChart {
+    pub title: String,
+    pub labels: Vec<String>,
+    pub data: Vec<u32>,
+    pub colors: Vec<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkHealth {
+    pub title: String,
+    pub regions: Vec<NetworkRegion>,
+    pub stats: Vec<NetworkStat>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkRegion {
+    pub name: String,
+    pub value: String,
+    pub width: String,
+    pub color: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkStat {
+    pub value: String,
+    pub label: String,
+    pub color: String,
+}
+
+impl DashboardResponse {
+    pub fn empty() -> Self {
+        Self {
+            sidebar: Sidebar {
+                sections: vec![
+                    SidebarSection {
+                        label: "概览".to_string(),
+                        items: vec![
+                            SidebarItem {
+                                label: "仪表盘".to_string(),
+                                icon: "grid".to_string(),
+                                active: true,
+                                badge: None,
+                                tooltip: None,
+                            },
+                            SidebarItem {
+                                label: "数据分析".to_string(),
+                                icon: "analytics".to_string(),
+                                active: false,
+                                badge: None,
+                                tooltip: None,
+                            },
+                        ],
+                    },
+                    SidebarSection {
+                        label: "服务器".to_string(),
+                        items: vec![
+                            SidebarItem {
+                                label: "服务器管理".to_string(),
+                                icon: "server-manager".to_string(),
+                                active: false,
+                                badge: Some("0".to_string()),
+                                tooltip: Some("服务器".to_string()),
+                            },
+                            SidebarItem {
+                                label: "节点".to_string(),
+                                icon: "globe".to_string(),
+                                active: false,
+                                badge: None,
+                                tooltip: None,
+                            },
+                            SidebarItem {
+                                label: "备份".to_string(),
+                                icon: "cube".to_string(),
+                                active: false,
+                                badge: None,
+                                tooltip: None,
+                            },
+                        ],
+                    },
+                    SidebarSection {
+                        label: "管理".to_string(),
+                        items: vec![
+                            SidebarItem {
+                                label: "玩家".to_string(),
+                                icon: "players".to_string(),
+                                active: false,
+                                badge: None,
+                                tooltip: None,
+                            },
+                            SidebarItem {
+                                label: "安全".to_string(),
+                                icon: "shield".to_string(),
+                                active: false,
+                                badge: None,
+                                tooltip: None,
+                            },
+                            SidebarItem {
+                                label: "日志".to_string(),
+                                icon: "file".to_string(),
+                                active: false,
+                                badge: None,
+                                tooltip: None,
+                            },
+                            SidebarItem {
+                                label: "网络".to_string(),
+                                icon: "network".to_string(),
+                                active: false,
+                                badge: None,
+                                tooltip: None,
+                            },
+                        ],
+                    },
+                    SidebarSection {
+                        label: "系统".to_string(),
+                        items: vec![
+                            SidebarItem {
+                                label: "通知".to_string(),
+                                icon: "mail".to_string(),
+                                active: false,
+                                badge: Some("0".to_string()),
+                                tooltip: None,
+                            },
+                            SidebarItem {
+                                label: "设置".to_string(),
+                                icon: "settings".to_string(),
+                                active: false,
+                                badge: None,
+                                tooltip: None,
+                            },
+                        ],
+                    },
+                ],
+                user: SidebarUser {
+                    initials: "SA".to_string(),
+                    name: "超级管理员".to_string(),
+                    role: "系统管理员".to_string(),
+                },
+            },
+            header: Header {
+                search_placeholder: "搜索服务器、玩家、日志…".to_string(),
+                search_shortcut: "⌘K".to_string(),
+                live_label: "待连接".to_string(),
+                profile_initials: "SA".to_string(),
+            },
+            page: Page {
+                title: "仪表盘".to_string(),
+                subtitle: "游戏服务器基础设施总览".to_string(),
+                refresh_label: "刷新".to_string(),
+                add_server_label: "添加服务器".to_string(),
+            },
+            stats: vec![
+                empty_stat(
+                    "服务器总数",
+                    "indigo",
+                    "server-manager",
+                    "spark1",
+                    "#6366f1",
+                ),
+                empty_stat("在线玩家", "green", "players", "spark2", "#10b981"),
+                empty_stat("平均 CPU 占用", "orange", "cpu", "spark3", "#f97316"),
+                empty_stat("已用带宽", "purple", "bandwidth", "spark4", "#8b5cf6"),
+                empty_stat("运行时间", "blue", "analytics", "spark5", "#3b82f6"),
+                empty_stat("活跃事件", "red", "alert", "spark6", "#ef4444"),
+            ],
+            players_overview: PlayersOverview {
+                title: "在线玩家 — 24 小时概览".to_string(),
+                subtitle: "全服实时并发玩家趋势".to_string(),
+                tabs: vec!["24小时".to_string(), "7天".to_string(), "30天".to_string()],
+                active_tab: "24小时".to_string(),
+                export_label: "导出".to_string(),
+                labels: vec![],
+                data: vec![],
+            },
+            resource_chart: ResourceChart {
+                title: "CPU 与内存占用".to_string(),
+                subtitle: "基础设施资源使用情况".to_string(),
+                labels: vec![],
+                cpu: vec![],
+                ram: vec![],
+            },
+            distribution: Distribution {
+                title: "游戏类型分布".to_string(),
+                subtitle: "各游戏活跃服务器数量".to_string(),
+                total: "--".to_string(),
+                total_label: "台服务器".to_string(),
+                labels: vec![],
+                values: vec![],
+                colors: vec![],
+            },
+            node_progress: vec![],
+            table: ServerTable {
+                title: "服务器管理".to_string(),
+                subtitle: "管理并监控所有游戏服务器".to_string(),
+                search_placeholder: "搜索服务器…".to_string(),
+                game_options: vec!["全部游戏".to_string()],
+                status_options: vec!["全部状态".to_string()],
+                rows: vec![],
+                pagination: Pagination {
+                    summary: "当前显示 0 / 0 台服务器".to_string(),
+                    pages: vec!["1".to_string()],
+                    active: "1".to_string(),
+                },
+            },
+            quick_kpis: vec![
+                KpiCard {
+                    label: "平均延迟".to_string(),
+                    value: "--".to_string(),
+                    sub: "等待后端数据".to_string(),
+                    color: Some("var(--green)".to_string()),
+                },
+                KpiCard {
+                    label: "丢包率".to_string(),
+                    value: "--".to_string(),
+                    sub: "等待后端数据".to_string(),
+                    color: Some("var(--accent)".to_string()),
+                },
+                KpiCard {
+                    label: "Tick 速率".to_string(),
+                    value: "--".to_string(),
+                    sub: "等待后端数据".to_string(),
+                    color: None,
+                },
+                KpiCard {
+                    label: "拦截 DDoS".to_string(),
+                    value: "--".to_string(),
+                    sub: "等待后端数据".to_string(),
+                    color: Some("var(--red)".to_string()),
+                },
+            ],
+            node_locations: NodeLocations {
+                title: "节点位置".to_string(),
+                nodes: vec![],
+                footer: "0 个节点 · 0 个地区".to_string(),
+            },
+            activities: vec![],
+            top_players: vec![],
+            bandwidth: BandwidthChart {
+                title: "各服务器带宽".to_string(),
+                labels: vec![],
+                data: vec![],
+                colors: vec![],
+            },
+            network_health: NetworkHealth {
+                title: "网络健康度".to_string(),
+                regions: vec![],
+                stats: vec![
+                    NetworkStat {
+                        value: "--".to_string(),
+                        label: "服务可用性".to_string(),
+                        color: "var(--green)".to_string(),
+                    },
+                    NetworkStat {
+                        value: "--".to_string(),
+                        label: "丢包率".to_string(),
+                        color: "var(--accent)".to_string(),
+                    },
+                ],
+            },
+        }
+    }
+}
+
+fn empty_stat(
+    label: &str,
+    color: &str,
+    icon: &str,
+    sparkline_id: &str,
+    sparkline_color: &str,
+) -> StatCard {
+    StatCard {
+        label: label.to_string(),
+        value: "--".to_string(),
+        change: "待接入".to_string(),
+        change_direction: "neutral".to_string(),
+        trend: "等待后端返回数据".to_string(),
+        color: color.to_string(),
+        icon: icon.to_string(),
+        sparkline_id: sparkline_id.to_string(),
+        sparkline_color: sparkline_color.to_string(),
+        sparkline_data: vec![],
+    }
+}

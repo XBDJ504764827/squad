@@ -1,43 +1,38 @@
-import { createDefaultDashboardData } from '../data/defaultDashboard'
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '/api'
 
-const clone = (value) => {
-  if (typeof structuredClone === 'function') {
-    return structuredClone(value)
+async function request(path, options = {}) {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options.headers ?? {}),
+    },
+    ...options,
+  })
+
+  if (!response.ok) {
+    throw new Error(`API request failed: ${response.status}`)
   }
-  return JSON.parse(JSON.stringify(value))
-}
 
-let dataAdapter = {
-  async fetchDashboard() {
-    return clone(createDefaultDashboardData())
-  },
-}
+  if (response.status === 204) {
+    return null
+  }
 
-let actionHandlers = {
-  async onRefresh() {},
-  async onAddServer() {},
-  async onExportPlayers() {},
-  async onViewAllActivity() {},
-  async onServerConsole() {},
-  async onServerRestart() {},
-  async onServerStart() {},
+  return response.json()
 }
 
 export const dashboardApi = {
-  setDataAdapter(nextAdapter = {}) {
-    dataAdapter = { ...dataAdapter, ...nextAdapter }
-  },
-  setActionHandlers(nextHandlers = {}) {
-    actionHandlers = { ...actionHandlers, ...nextHandlers }
-  },
   async getDashboardData() {
-    const payload = await dataAdapter.fetchDashboard()
-    return this.normalizeDashboardData(payload)
+    return request('/dashboard')
   },
-  normalizeDashboardData(payload) {
-    return payload
+  async getHealth() {
+    return request('/health')
   },
-  get actions() {
-    return actionHandlers
+  actions: {
+    async onAddServer() {},
+    async onExportPlayers() {},
+    async onViewAllActivity() {},
+    async onServerConsole() {},
+    async onServerRestart() {},
+    async onServerStart() {},
   },
 }
