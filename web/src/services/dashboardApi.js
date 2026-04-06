@@ -10,7 +10,18 @@ async function request(path, options = {}) {
   })
 
   if (!response.ok) {
-    throw new Error(`API request failed: ${response.status}`)
+    let message = `API request failed: ${response.status}`
+
+    try {
+      const errorPayload = await response.json()
+      if (typeof errorPayload?.message === 'string') {
+        message = errorPayload.message
+      }
+    } catch {
+      // Ignore JSON parsing failures for non-JSON error responses.
+    }
+
+    throw new Error(message)
   }
 
   if (response.status === 204) {
@@ -26,6 +37,12 @@ export const dashboardApi = {
   },
   async getHealth() {
     return request('/health')
+  },
+  async addServer(payload) {
+    return request('/servers', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
   },
   actions: {
     async onAddServer() {},

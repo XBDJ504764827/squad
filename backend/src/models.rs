@@ -1,4 +1,5 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 
 #[derive(Clone, Serialize)]
 pub struct HealthResponse {
@@ -293,8 +294,43 @@ pub struct NetworkStat {
     pub color: String,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddServerRequest {
+    pub name: String,
+    pub ip: String,
+    pub rcon_port: u16,
+    pub rcon_password: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ActionResponse {
+    pub message: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ErrorResponse {
+    pub message: String,
+}
+
+#[derive(Clone, FromRow)]
+pub struct ManagedServer {
+    pub name: String,
+    pub ip: String,
+    pub rcon_port: i32,
+    #[allow(dead_code)]
+    pub rcon_password: String,
+}
+
 impl DashboardResponse {
-    pub fn empty() -> Self {
+    pub fn from_servers(servers: &[ManagedServer]) -> Self {
+        let server_count = servers.len();
+        let server_rows = servers
+            .iter()
+            .map(ServerRow::from_server)
+            .collect::<Vec<_>>();
+        let server_count_text = server_count.to_string();
+
         Self {
             sidebar: Sidebar {
                 sections: vec![
@@ -324,7 +360,7 @@ impl DashboardResponse {
                                 label: "服务器管理".to_string(),
                                 icon: "server-manager".to_string(),
                                 active: false,
-                                badge: Some("0".to_string()),
+                                badge: Some(server_count_text.clone()),
                                 tooltip: Some("服务器".to_string()),
                             },
                             SidebarItem {
@@ -405,7 +441,7 @@ impl DashboardResponse {
             header: Header {
                 search_placeholder: "搜索服务器、玩家、日志…".to_string(),
                 search_shortcut: "⌘K".to_string(),
-                live_label: "待连接".to_string(),
+                live_label: "已连接".to_string(),
                 profile_initials: "SA".to_string(),
             },
             page: Page {
@@ -415,13 +451,18 @@ impl DashboardResponse {
                 add_server_label: "添加服务器".to_string(),
             },
             stats: vec![
-                empty_stat(
-                    "服务器总数",
-                    "indigo",
-                    "server-manager",
-                    "spark1",
-                    "#6366f1",
-                ),
+                StatCard {
+                    label: "服务器总数".to_string(),
+                    value: server_count_text.clone(),
+                    change: "已接入".to_string(),
+                    change_direction: "neutral".to_string(),
+                    trend: format!("当前已接入 {} 台服务器", server_count),
+                    color: "indigo".to_string(),
+                    icon: "server-manager".to_string(),
+                    sparkline_id: "spark1".to_string(),
+                    sparkline_color: "#6366f1".to_string(),
+                    sparkline_data: vec![],
+                },
                 empty_stat("在线玩家", "green", "players", "spark2", "#10b981"),
                 empty_stat("平均 CPU 占用", "orange", "cpu", "spark3", "#f97316"),
                 empty_stat("已用带宽", "purple", "bandwidth", "spark4", "#8b5cf6"),
@@ -447,7 +488,7 @@ impl DashboardResponse {
             distribution: Distribution {
                 title: "游戏类型分布".to_string(),
                 subtitle: "各游戏活跃服务器数量".to_string(),
-                total: "--".to_string(),
+                total: server_count_text.clone(),
                 total_label: "台服务器".to_string(),
                 labels: vec![],
                 values: vec![],
@@ -459,10 +500,10 @@ impl DashboardResponse {
                 subtitle: "管理并监控所有游戏服务器".to_string(),
                 search_placeholder: "搜索服务器…".to_string(),
                 game_options: vec!["全部游戏".to_string()],
-                status_options: vec!["全部状态".to_string()],
-                rows: vec![],
+                status_options: vec!["全部状态".to_string(), "在线".to_string()],
+                rows: server_rows,
                 pagination: Pagination {
-                    summary: "当前显示 0 / 0 台服务器".to_string(),
+                    summary: format!("当前显示 {} / {} 台服务器", server_count, server_count),
                     pages: vec!["1".to_string()],
                     active: "1".to_string(),
                 },
@@ -522,6 +563,42 @@ impl DashboardResponse {
                     },
                 ],
             },
+        }
+    }
+}
+
+impl ServerRow {
+    fn from_server(server: &ManagedServer) -> Self {
+        Self {
+            name: server.name.clone(),
+            ip: format!("{}:{}", server.ip, server.rcon_port),
+            dot: "online".to_string(),
+            game: Badge {
+                label: "未识别".to_string(),
+                class_name: "badge badge-gray".to_string(),
+            },
+            status: Badge {
+                label: "● 在线".to_string(),
+                class_name: "badge badge-green".to_string(),
+            },
+            players: "-- / --".to_string(),
+            cpu: ProgressData {
+                width: "0%".to_string(),
+                background: "var(--text-muted)".to_string(),
+                value: "--".to_string(),
+                muted: true,
+            },
+            ram: ProgressData {
+                width: "0%".to_string(),
+                background: "var(--text-muted)".to_string(),
+                value: "--".to_string(),
+                muted: true,
+            },
+            region: Badge {
+                label: "--".to_string(),
+                class_name: "badge badge-gray".to_string(),
+            },
+            actions: vec![],
         }
     }
 }
