@@ -151,6 +151,7 @@ pub struct ServerTable {
 pub struct ServerRow {
     pub name: String,
     pub ip: String,
+    pub uuid: String,
     pub dot: String,
     pub game: Badge,
     pub status: Badge,
@@ -303,9 +304,31 @@ pub struct AddServerRequest {
     pub rcon_password: String,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateServerRequest {
+    pub name: String,
+    pub ip: String,
+    pub rcon_port: u16,
+    pub rcon_password: String,
+}
+
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ActionResponse {
     pub message: String,
+    pub server_uuid: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedServerDetailResponse {
+    pub name: String,
+    pub ip: String,
+    pub rcon_port: u16,
+    pub rcon_password: String,
+    pub server_uuid: String,
+    pub status_label: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -318,6 +341,7 @@ pub struct ManagedServer {
     pub name: String,
     pub ip: String,
     pub rcon_port: i32,
+    pub server_uuid: String,
     #[allow(dead_code)]
     pub rcon_password: String,
 }
@@ -572,6 +596,7 @@ impl ServerRow {
         Self {
             name: server.name.clone(),
             ip: format!("{}:{}", server.ip, server.rcon_port),
+            uuid: server.server_uuid.clone(),
             dot: "online".to_string(),
             game: Badge {
                 label: "未识别".to_string(),
@@ -598,7 +623,24 @@ impl ServerRow {
                 label: "--".to_string(),
                 class_name: "badge badge-gray".to_string(),
             },
-            actions: vec![],
+            actions: vec![
+                "manage".to_string(),
+                "edit".to_string(),
+                "delete".to_string(),
+            ],
+        }
+    }
+}
+
+impl ManagedServerDetailResponse {
+    pub fn from_server(server: &ManagedServer) -> Self {
+        Self {
+            name: server.name.clone(),
+            ip: server.ip.clone(),
+            rcon_port: server.rcon_port as u16,
+            rcon_password: server.rcon_password.clone(),
+            server_uuid: server.server_uuid.clone(),
+            status_label: "● 在线".to_string(),
         }
     }
 }

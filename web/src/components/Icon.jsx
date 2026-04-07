@@ -101,6 +101,93 @@ export default function Icon({ name, width = 16, height = 16, strokeWidth = 2, s
           <path d="M3 12h3M18 12h3M12 3v3M12 18v3" />
         </Svg>
       )
+    case 'sliders':
+      return (
+        <Svg width={width} height={height} strokeWidth={strokeWidth} style={style}>
+          <line x1="4" y1="21" x2="4" y2="14" />
+          <line x1="4" y1="10" x2="4" y2="3" />
+          <line x1="12" y1="21" x2="12" y2="12" />
+          <line x1="12" y1="8" x2="12" y2="3" />
+          <line x1="20" y1="21" x2="20" y2="16" />
+          <line x1="20" y1="12" x2="20" y2="3" />
+          <line x1="2" y1="14" x2="6" y2="14" />
+          <line x1="10" y1="8" x2="14" y2="8" />
+          <line x1="18" y1="16" x2="22" y2="16" />
+        </Svg>
+      )
+    case 'messages':
+      return (
+        <Svg width={width} height={height} strokeWidth={strokeWidth} style={style}>
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+          <line x1="8" y1="9" x2="16" y2="9" />
+          <line x1="8" y1="13" x2="13" y2="13" />
+        </Svg>
+      )
+    case 'radar':
+      return (
+        <Svg width={width} height={height} strokeWidth={strokeWidth} style={style}>
+          <circle cx="12" cy="12" r="10" />
+          <circle cx="12" cy="12" r="6" />
+          <line x1="12" y1="2" x2="12" y2="12" />
+          <line x1="12" y1="12" x2="18" y2="9" />
+        </Svg>
+      )
+    case 'crosshair':
+      return (
+        <Svg width={width} height={height} strokeWidth={strokeWidth} style={style}>
+          <circle cx="12" cy="12" r="7" />
+          <line x1="12" y1="2" x2="12" y2="5" />
+          <line x1="12" y1="19" x2="12" y2="22" />
+          <line x1="2" y1="12" x2="5" y2="12" />
+          <line x1="19" y1="12" x2="22" y2="12" />
+          <circle cx="12" cy="12" r="2" />
+        </Svg>
+      )
+    case 'trophy':
+      return (
+        <Svg width={width} height={height} strokeWidth={strokeWidth} style={style}>
+          <path d="M8 21h8" />
+          <path d="M12 17v4" />
+          <path d="M8 4h8v4a4 4 0 0 1-8 0z" />
+          <path d="M16 6h3a2 2 0 0 1 0 4h-3" />
+          <path d="M8 6H5a2 2 0 0 0 0 4h3" />
+        </Svg>
+      )
+    case 'file-code':
+      return (
+        <Svg width={width} height={height} strokeWidth={strokeWidth} style={style}>
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+          <polyline points="14 2 14 8 20 8" />
+          <polyline points="10 13 8 15 10 17" />
+          <polyline points="14 13 16 15 14 17" />
+        </Svg>
+      )
+    case 'settings-sliders':
+      return (
+        <Svg width={width} height={height} strokeWidth={strokeWidth} style={style}>
+          <line x1="4" y1="21" x2="4" y2="4" />
+          <line x1="12" y1="21" x2="12" y2="10" />
+          <line x1="20" y1="21" x2="20" y2="7" />
+          <circle cx="4" cy="9" r="2" />
+          <circle cx="12" cy="15" r="2" />
+          <circle cx="20" cy="12" r="2" />
+        </Svg>
+      )
+    case 'history':
+      return (
+        <Svg width={width} height={height} strokeWidth={strokeWidth} style={style}>
+          <path d="M3 12a9 9 0 1 0 3-6.7" />
+          <polyline points="3 3 3 9 9 9" />
+          <path d="M12 7v5l3 3" />
+        </Svg>
+      )
+    case 'key-round':
+      return (
+        <Svg width={width} height={height} strokeWidth={strokeWidth} style={style}>
+          <circle cx="7.5" cy="15.5" r="3.5" />
+          <path d="M10 13l8-8 3 3-2 2 2 2-2 2-2-2-2 2" />
+        </Svg>
+      )
     case 'menu':
       return (
         <Svg width={width} height={height} strokeWidth={strokeWidth} style={style}>
@@ -157,11 +244,34 @@ export default function Icon({ name, width = 16, height = 16, strokeWidth = 2, s
           <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
         </Svg>
       )
+    case 'arrow-left':
+      return (
+        <Svg width={width} height={height} strokeWidth={strokeWidth} style={style}>
+          <line x1="19" y1="12" x2="5" y2="12" />
+          <polyline points="12 19 5 12 12 5" />
+        </Svg>
+      )
     case 'plus':
       return (
         <Svg width={width} height={height} strokeWidth={strokeWidth} style={style}>
           <line x1="12" y1="5" x2="12" y2="19" />
           <line x1="5" y1="12" x2="19" y2="12" />
+        </Svg>
+      )
+    case 'pencil':
+      return (
+        <Svg width={width} height={height} strokeWidth={strokeWidth} style={style}>
+          <path d="M12 20h9" />
+          <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
+        </Svg>
+      )
+    case 'trash':
+      return (
+        <Svg width={width} height={height} strokeWidth={strokeWidth} style={style}>
+          <polyline points="3 6 5 6 21 6" />
+          <path d="M19 6l-1 14H6L5 6" />
+          <path d="M10 11v6M14 11v6" />
+          <path d="M9 6V4h6v2" />
         </Svg>
       )
     case 'cpu':

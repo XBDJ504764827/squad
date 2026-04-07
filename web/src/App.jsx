@@ -3,6 +3,16 @@ import Chart from 'chart.js/auto'
 import Icon from './components/Icon'
 import { createEmptyDashboardData } from './data/defaultDashboard'
 import { dashboardApi } from './services/dashboardApi'
+import { buildServerManagementPage, buildServerViewAfterDelete } from './services/serverManagementView'
+import {
+  appendRealtimeLogEntry,
+  createInitialRealtimeLogs,
+  DEFAULT_WORKBENCH_SECTION,
+  SERVER_WORKBENCH_SECTIONS,
+  createServerWorkbenchContent,
+  filterRealtimeLogEntries,
+  normalizeWorkbenchSection,
+} from './services/serverWorkbench'
 
 const EMPTY_DASHBOARD = createEmptyDashboardData()
 
@@ -25,6 +35,22 @@ function formatCurrentTime() {
     second: '2-digit',
     hour12: false,
   })
+}
+
+function splitServerAddress(address) {
+  const separatorIndex = address.lastIndexOf(':')
+
+  if (separatorIndex === -1) {
+    return {
+      ip: address,
+      rconPort: '--',
+    }
+  }
+
+  return {
+    ip: address.slice(0, separatorIndex),
+    rconPort: address.slice(separatorIndex + 1),
+  }
 }
 
 function EmptyState({ message }) {
@@ -363,13 +389,47 @@ function ProgressCell({ data }) {
   )
 }
 
-function TableActionButtons({ actions, row, index, onConsole, onRestart, onStart }) {
+function TableActionButtons({
+  actions,
+  row,
+  onManage,
+  onEdit,
+  onDelete,
+  onConsole,
+  onRestart,
+  onStart,
+}) {
   return (
-    <div style={{ display: 'flex', gap: '4px' }}>
+    <div className="table-action-group">
+      {actions.includes('manage') && (
+        <button className="btn btn-primary btn-sm" type="button" onClick={() => onManage(row)}>
+          管理
+        </button>
+      )}
+      {actions.includes('edit') && (
+        <button
+          className="btn btn-secondary btn-sm btn-icon"
+          title="编辑服务器"
+          type="button"
+          onClick={() => onEdit(row)}
+        >
+          <Icon name="pencil" width={12} height={12} />
+        </button>
+      )}
+      {actions.includes('delete') && (
+        <button
+          className="btn btn-danger btn-sm btn-icon"
+          title="删除服务器"
+          type="button"
+          onClick={() => onDelete(row)}
+        >
+          <Icon name="trash" width={12} height={12} />
+        </button>
+      )}
       {actions.includes('console') && (
         <button
           className="btn btn-secondary btn-sm btn-icon"
-          title={index === 0 ? '控制台' : undefined}
+          title="控制台"
           type="button"
           onClick={() => onConsole(row)}
         >
@@ -379,7 +439,7 @@ function TableActionButtons({ actions, row, index, onConsole, onRestart, onStart
       {actions.includes('restart') && (
         <button
           className="btn btn-secondary btn-sm btn-icon"
-          title={index === 0 ? '重启' : undefined}
+          title="重启"
           type="button"
           onClick={() => onRestart(row)}
         >
@@ -401,6 +461,9 @@ function TableActionButtons({ actions, row, index, onConsole, onRestart, onStart
 }
 
 function AddServerModal({
+  title = '添加服务器',
+  subtitle = '录入服务器信息后，系统会先进行 RCON 验证。',
+  submitLabel = '验证并添加',
   form,
   submitting,
   error,
@@ -413,8 +476,8 @@ function AddServerModal({
       <div className="modal-card">
         <div className="modal-header">
           <div>
-            <div className="modal-title">添加服务器</div>
-            <div className="modal-subtitle">录入服务器信息后，系统会先进行 RCON 验证。</div>
+            <div className="modal-title">{title}</div>
+            <div className="modal-subtitle">{subtitle}</div>
           </div>
           <button className="icon-btn" type="button" title="关闭" onClick={onClose}>
             <Icon name="plus" width={14} height={14} style={{ transform: 'rotate(45deg)' }} />
@@ -469,10 +532,46 @@ function AddServerModal({
               取消
             </button>
             <button className="btn btn-primary" type="submit" disabled={submitting}>
-              {submitting ? '验证中…' : '验证并添加'}
+              {submitting ? '提交中…' : submitLabel}
             </button>
           </div>
         </form>
+      </div>
+    </div>
+  )
+}
+
+function DeleteServerModal({ server, submitting, error, onClose, onConfirm }) {
+  return (
+    <div className="modal-backdrop">
+      <div className="modal-card modal-card-sm">
+        <div className="modal-header">
+          <div>
+            <div className="modal-title">删除服务器</div>
+            <div className="modal-subtitle">该操作会移除当前服务器记录，删除后不可恢复。</div>
+          </div>
+          <button className="icon-btn" type="button" title="关闭" onClick={onClose}>
+            <Icon name="plus" width={14} height={14} style={{ transform: 'rotate(45deg)' }} />
+          </button>
+        </div>
+        <div className="confirm-body">
+          <div className="confirm-text">
+            确认删除服务器 <strong>{server.name}</strong> 吗？
+          </div>
+          <div className="confirm-meta">
+            <div>地址：{server.ip}</div>
+            <div>UUID：{server.uuid}</div>
+          </div>
+          {error ? <div className="form-error">{error}</div> : null}
+          <div className="modal-actions">
+            <button className="btn btn-secondary" type="button" onClick={onClose} disabled={submitting}>
+              取消
+            </button>
+            <button className="btn btn-danger" type="button" onClick={onConfirm} disabled={submitting}>
+              {submitting ? '删除中…' : '确认删除'}
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   )
@@ -488,6 +587,13 @@ function App() {
   const [theme, setTheme] = useState('light')
   const [collapsed, setCollapsed] = useState(false)
   const [activeView, setActiveView] = useState('dashboard')
+  const [selectedServerUuid, setSelectedServerUuid] = useState(null)
+  const [activeWorkbenchSection, setActiveWorkbenchSection] = useState(DEFAULT_WORKBENCH_SECTION)
+  const [realtimeLogEntries, setRealtimeLogEntries] = useState(() => createInitialRealtimeLogs('GamePanel'))
+  const [realtimeLogLevel, setRealtimeLogLevel] = useState('ALL')
+  const [realtimeLogSearchTerm, setRealtimeLogSearchTerm] = useState('')
+  const [realtimeLogPaused, setRealtimeLogPaused] = useState(false)
+  const [realtimeLogAutoScroll, setRealtimeLogAutoScroll] = useState(true)
   const [currentTime, setCurrentTime] = useState(() => formatCurrentTime())
   const [globalSearch, setGlobalSearch] = useState('')
   const [tableSearch, setTableSearch] = useState('')
@@ -495,7 +601,9 @@ function App() {
   const [statusFilter, setStatusFilter] = useState(EMPTY_DASHBOARD.table.statusOptions[0])
   const [activeTab, setActiveTab] = useState(EMPTY_DASHBOARD.playersOverview.activeTab)
   const [isLoading, setIsLoading] = useState(true)
-  const [isAddServerModalOpen, setIsAddServerModalOpen] = useState(false)
+  const [isServerFormModalOpen, setIsServerFormModalOpen] = useState(false)
+  const [serverFormMode, setServerFormMode] = useState('add')
+  const [editingServerUuid, setEditingServerUuid] = useState(null)
   const [serverForm, setServerForm] = useState({
     name: '',
     ip: '',
@@ -504,13 +612,92 @@ function App() {
   })
   const [serverFormError, setServerFormError] = useState('')
   const [serverFormSubmitting, setServerFormSubmitting] = useState(false)
+  const [deleteTargetServer, setDeleteTargetServer] = useState(null)
+  const [deleteServerSubmitting, setDeleteServerSubmitting] = useState(false)
+  const [deleteServerError, setDeleteServerError] = useState('')
+  const [managedServerDetail, setManagedServerDetail] = useState(null)
+  const [isServerDetailLoading, setIsServerDetailLoading] = useState(false)
+  const [serverDetailError, setServerDetailError] = useState('')
   const [flashMessage, setFlashMessage] = useState(null)
+  const [dashboardLoadError, setDashboardLoadError] = useState('')
+  const [connectionStatus, setConnectionStatus] = useState({
+    tone: 'loading',
+    label: '连接中',
+  })
+  const realtimeLogViewportRef = useRef(null)
+  const normalizedWorkbenchSection = normalizeWorkbenchSection(activeWorkbenchSection)
+  const activeWorkbenchSectionConfig = SERVER_WORKBENCH_SECTIONS.find(
+    (section) => section.id === normalizedWorkbenchSection,
+  ) ?? SERVER_WORKBENCH_SECTIONS[0]
+  const serverManagementPage = buildServerManagementPage({
+    rows: dashboard.table.rows,
+    activeView,
+    selectedServerUuid,
+  })
+
+  const applyDashboardPayload = (payload) => {
+    setDashboard(payload)
+    setActiveTab(payload.playersOverview.activeTab || payload.playersOverview.tabs[0] || '')
+    setGameFilter(payload.table.gameOptions[0] || '')
+    setStatusFilter(payload.table.statusOptions[0] || '')
+    setDashboardLoadError('')
+    setConnectionStatus({
+      tone: 'connected',
+      label: payload.header.liveLabel || '后端已连接',
+    })
+  }
+
+  const applyEmptyDashboardState = (message) => {
+    setDashboard(createEmptyDashboardData())
+    setActiveTab(EMPTY_DASHBOARD.playersOverview.activeTab)
+    setGameFilter(EMPTY_DASHBOARD.table.gameOptions[0])
+    setStatusFilter(EMPTY_DASHBOARD.table.statusOptions[0])
+    setDashboardLoadError(message)
+    setConnectionStatus({
+      tone: 'error',
+      label: '后端未连接',
+    })
+  }
+
+  const resetServerForm = () => {
+    setServerForm({
+      name: '',
+      ip: '',
+      rconPort: '',
+      rconPassword: '',
+    })
+    setServerFormError('')
+    setEditingServerUuid(null)
+  }
+
+  const loadServerDetail = async (serverUuid) => {
+    setIsServerDetailLoading(true)
+    setServerDetailError('')
+
+    try {
+      const detail = await dashboardApi.getServer(serverUuid)
+      setManagedServerDetail(detail)
+      return detail
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '读取服务器详情失败，请稍后重试。'
+      setManagedServerDetail(null)
+      setServerDetailError(message)
+      throw new Error(message)
+    } finally {
+      setIsServerDetailLoading(false)
+    }
+  }
 
   useEffect(() => {
     let cancelled = false
 
     async function loadInitialDashboardData() {
       setIsLoading(true)
+      setConnectionStatus({
+        tone: 'loading',
+        label: '连接中',
+      })
+      setDashboardLoadError('')
 
       try {
         const payload = await dashboardApi.getDashboardData()
@@ -518,20 +705,18 @@ function App() {
           return
         }
 
-        setDashboard(payload)
-        setActiveTab(payload.playersOverview.activeTab || payload.playersOverview.tabs[0] || '')
-        setGameFilter(payload.table.gameOptions[0] || '')
-        setStatusFilter(payload.table.statusOptions[0] || '')
+        applyDashboardPayload(payload)
       } catch (error) {
         console.error('加载仪表盘数据失败', error)
         if (cancelled) {
           return
         }
 
-        setDashboard(createEmptyDashboardData())
-        setActiveTab(EMPTY_DASHBOARD.playersOverview.activeTab)
-        setGameFilter(EMPTY_DASHBOARD.table.gameOptions[0])
-        setStatusFilter(EMPTY_DASHBOARD.table.statusOptions[0])
+        applyEmptyDashboardState(
+          error instanceof Error
+            ? `后端联调失败：${error.message}`
+            : '后端联调失败，请确认后端和数据库已启动。',
+        )
       } finally {
         if (!cancelled) {
           setIsLoading(false)
@@ -561,9 +746,65 @@ function App() {
     }
   }, [])
 
-  const headerLiveLabel = isLoading ? '加载中' : dashboard.header.liveLabel
-  const currentPageTitle = activeView === 'server-manager' ? dashboard.table.title : dashboard.page.title
-  const currentPageSubtitle = activeView === 'server-manager' ? dashboard.table.subtitle : dashboard.page.subtitle
+  useEffect(() => {
+    const logServerName = managedServerDetail?.name ?? serverManagementPage.server?.name ?? 'GamePanel'
+    setRealtimeLogEntries(createInitialRealtimeLogs(logServerName))
+    setRealtimeLogLevel('ALL')
+    setRealtimeLogSearchTerm('')
+    setRealtimeLogPaused(false)
+    setRealtimeLogAutoScroll(true)
+  }, [managedServerDetail?.name, serverManagementPage.server?.name, selectedServerUuid])
+
+  useEffect(() => {
+    if (activeView !== 'server-detail' || normalizedWorkbenchSection !== 'realtime-logs' || realtimeLogPaused) {
+      return undefined
+    }
+
+    const logServerName = managedServerDetail?.name ?? serverManagementPage.server?.name ?? 'GamePanel'
+    const intervalId = window.setInterval(() => {
+      setRealtimeLogEntries((currentEntries) => appendRealtimeLogEntry(currentEntries, logServerName))
+    }, 1400)
+
+    return () => {
+      window.clearInterval(intervalId)
+    }
+  }, [
+    activeView,
+    normalizedWorkbenchSection,
+    realtimeLogPaused,
+    managedServerDetail?.name,
+    serverManagementPage.server?.name,
+  ])
+
+  const filteredRealtimeLogEntries = filterRealtimeLogEntries(realtimeLogEntries, {
+    level: realtimeLogLevel,
+    searchTerm: realtimeLogSearchTerm,
+  })
+
+  useEffect(() => {
+    if (!realtimeLogAutoScroll || normalizedWorkbenchSection !== 'realtime-logs') {
+      return
+    }
+
+    const viewport = realtimeLogViewportRef.current
+    if (!viewport) {
+      return
+    }
+
+    viewport.scrollTop = viewport.scrollHeight
+  }, [filteredRealtimeLogEntries, realtimeLogAutoScroll, normalizedWorkbenchSection])
+
+  const headerLiveLabel = connectionStatus.label
+  const currentPageTitle = activeView === 'server-detail'
+    ? managedServerDetail?.name ?? serverManagementPage.title ?? '服务器详情'
+    : activeView === 'server-manager'
+      ? dashboard.table.title
+      : dashboard.page.title
+  const currentPageSubtitle = activeView === 'server-detail'
+    ? `服务器工作台 · ${activeWorkbenchSectionConfig.label}`
+    : activeView === 'server-manager'
+      ? dashboard.table.subtitle
+      : dashboard.page.subtitle
 
   const handleSidebarItemClick = (itemLabel) => {
     const nextView = NAVIGATION_VIEW_MAP[itemLabel]
@@ -571,38 +812,54 @@ function App() {
       return
     }
 
+    if (nextView !== 'server-detail') {
+      setSelectedServerUuid(null)
+      setManagedServerDetail(null)
+      setServerDetailError('')
+      setActiveWorkbenchSection(DEFAULT_WORKBENCH_SECTION)
+    }
+
     setActiveView(nextView)
   }
 
   const handleRefresh = async () => {
     setIsLoading(true)
+    setConnectionStatus({
+      tone: 'loading',
+      label: '刷新中',
+    })
+    setDashboardLoadError('')
 
     try {
       const payload = await dashboardApi.getDashboardData()
-      setDashboard(payload)
-      setActiveTab(payload.playersOverview.activeTab || payload.playersOverview.tabs[0] || '')
-      setGameFilter(payload.table.gameOptions[0] || '')
-      setStatusFilter(payload.table.statusOptions[0] || '')
+      applyDashboardPayload(payload)
+      if (selectedServerUuid) {
+        try {
+          const detail = await dashboardApi.getServer(selectedServerUuid)
+          setManagedServerDetail(detail)
+          setServerDetailError('')
+        } catch (error) {
+          const message = error instanceof Error ? error.message : '读取服务器详情失败，请稍后重试。'
+          setManagedServerDetail(null)
+          setServerDetailError(message)
+        }
+      }
     } catch (error) {
       console.error('刷新仪表盘数据失败', error)
-      setDashboard(createEmptyDashboardData())
-      setActiveTab(EMPTY_DASHBOARD.playersOverview.activeTab)
-      setGameFilter(EMPTY_DASHBOARD.table.gameOptions[0])
-      setStatusFilter(EMPTY_DASHBOARD.table.statusOptions[0])
+      applyEmptyDashboardState(
+        error instanceof Error
+          ? `后端联调失败：${error.message}`
+          : '后端联调失败，请确认后端和数据库已启动。',
+      )
     } finally {
       setIsLoading(false)
     }
   }
 
   const handleAddServer = async () => {
-    setServerForm({
-      name: '',
-      ip: '',
-      rconPort: '',
-      rconPassword: '',
-    })
-    setServerFormError('')
-    setIsAddServerModalOpen(true)
+    resetServerForm()
+    setServerFormMode('add')
+    setIsServerFormModalOpen(true)
   }
 
   const handleExportPlayers = async () => {
@@ -623,6 +880,61 @@ function App() {
 
   const handleServerStart = async (server) => {
     await dashboardApi.actions.onServerStart(server)
+  }
+
+  const handleManageServer = async (server) => {
+    setActiveView('server-detail')
+    setSelectedServerUuid(server.uuid)
+    setActiveWorkbenchSection(DEFAULT_WORKBENCH_SECTION)
+    setFlashMessage(null)
+
+    try {
+      await loadServerDetail(server.uuid)
+    } catch (error) {
+      setFlashMessage({
+        type: 'error',
+        text: error instanceof Error ? error.message : '读取服务器详情失败，请稍后重试。',
+      })
+    }
+  }
+
+  const handleEditServer = async (server) => {
+    setFlashMessage(null)
+    setServerFormError('')
+
+    try {
+      const detail =
+        managedServerDetail?.serverUuid === server.uuid ? managedServerDetail : await loadServerDetail(server.uuid)
+
+      setServerFormMode('edit')
+      setEditingServerUuid(server.uuid)
+      setServerForm({
+        name: detail.name,
+        ip: detail.ip,
+        rconPort: String(detail.rconPort),
+        rconPassword: detail.rconPassword,
+      })
+      setIsServerFormModalOpen(true)
+    } catch (error) {
+      setFlashMessage({
+        type: 'error',
+        text: error instanceof Error ? error.message : '读取服务器详情失败，请稍后重试。',
+      })
+    }
+  }
+
+  const handleDeleteServer = async (server) => {
+    setDeleteTargetServer(server)
+    setDeleteServerError('')
+    setFlashMessage(null)
+  }
+
+  const handleBackToServerList = () => {
+    setActiveView('server-manager')
+    setSelectedServerUuid(null)
+    setManagedServerDetail(null)
+    setServerDetailError('')
+    setActiveWorkbenchSection(DEFAULT_WORKBENCH_SECTION)
   }
 
   const handleServerFormChange = (event) => {
@@ -657,33 +969,73 @@ function App() {
     setServerFormSubmitting(true)
 
     try {
-      const response = await dashboardApi.addServer({
+      const payload = {
         name: serverForm.name.trim(),
         ip: serverForm.ip.trim(),
         rconPort: parsedPort,
         rconPassword: serverForm.rconPassword,
-      })
+      }
+      const response = serverFormMode === 'edit' && editingServerUuid
+        ? await dashboardApi.updateServer(editingServerUuid, payload)
+        : await dashboardApi.addServer(payload)
 
-      const payload = await dashboardApi.getDashboardData()
-      setDashboard(payload)
-      setActiveTab(payload.playersOverview.activeTab || payload.playersOverview.tabs[0] || '')
-      setGameFilter(payload.table.gameOptions[0] || '')
-      setStatusFilter(payload.table.statusOptions[0] || '')
-      setIsAddServerModalOpen(false)
-      setServerForm({
-        name: '',
-        ip: '',
-        rconPort: '',
-        rconPassword: '',
-      })
+      const nextDashboard = await dashboardApi.getDashboardData()
+      applyDashboardPayload(nextDashboard)
+      if (serverFormMode === 'edit' && editingServerUuid) {
+        const detail = await dashboardApi.getServer(editingServerUuid)
+        setManagedServerDetail(detail)
+        setServerDetailError('')
+      }
+      setIsServerFormModalOpen(false)
+      resetServerForm()
       setFlashMessage({
         type: 'success',
         text: response.message,
+        serverUuid: response.serverUuid,
       })
     } catch (error) {
       setServerFormError(error instanceof Error ? error.message : '添加服务器失败，请稍后重试。')
     } finally {
       setServerFormSubmitting(false)
+    }
+  }
+
+  const handleDeleteServerConfirm = async () => {
+    if (!deleteTargetServer) {
+      return
+    }
+
+    setDeleteServerSubmitting(true)
+    setDeleteServerError('')
+
+    try {
+      const response = await dashboardApi.deleteServer(deleteTargetServer.uuid)
+      const nextDashboard = await dashboardApi.getDashboardData()
+      applyDashboardPayload(nextDashboard)
+
+      const nextViewState = buildServerViewAfterDelete({
+        activeView,
+        selectedServerUuid,
+        deletedServerUuid: deleteTargetServer.uuid,
+      })
+      setActiveView(nextViewState.activeView)
+      setSelectedServerUuid(nextViewState.selectedServerUuid)
+      if (nextViewState.selectedServerUuid === null) {
+        setManagedServerDetail(null)
+        setServerDetailError('')
+        setActiveWorkbenchSection(DEFAULT_WORKBENCH_SECTION)
+      }
+
+      setDeleteTargetServer(null)
+      setFlashMessage({
+        type: 'success',
+        text: response.message,
+        serverUuid: response.serverUuid,
+      })
+    } catch (error) {
+      setDeleteServerError(error instanceof Error ? error.message : '删除服务器失败，请稍后重试。')
+    } finally {
+      setDeleteServerSubmitting(false)
     }
   }
 
@@ -734,14 +1086,15 @@ function App() {
           </thead>
           <tbody>
             {dashboard.table.rows.length > 0 ? (
-              dashboard.table.rows.map((row, index) => (
-                <tr key={row.name}>
+              dashboard.table.rows.map((row) => (
+                <tr key={row.uuid}>
                   <td>
                     <div className="server-name">
                       <span className={`server-dot ${row.dot}`}></span>
                       <div>
                         <div className="server-name-text">{row.name}</div>
                         <div className="server-ip">{row.ip}</div>
+                        <div className="server-uuid">UUID: {row.uuid}</div>
                       </div>
                     </div>
                   </td>
@@ -765,7 +1118,9 @@ function App() {
                     <TableActionButtons
                       actions={row.actions}
                       row={row}
-                      index={index}
+                      onManage={handleManageServer}
+                      onEdit={handleEditServer}
+                      onDelete={handleDeleteServer}
                       onConsole={handleServerConsole}
                       onRestart={handleServerRestart}
                       onStart={handleServerStart}
@@ -799,6 +1154,623 @@ function App() {
       </div>
     </div>
   )
+
+  const renderServerDetailView = () => {
+    const fallbackServer = serverManagementPage.server
+    const fallbackAddress = fallbackServer ? splitServerAddress(fallbackServer.ip) : null
+    const detailServer = managedServerDetail
+      ? managedServerDetail
+      : fallbackServer
+        ? {
+            name: fallbackServer.name,
+            ip: fallbackAddress?.ip ?? fallbackServer.ip,
+            rconPort: fallbackAddress?.rconPort ?? '--',
+            rconPassword: '',
+            serverUuid: fallbackServer.uuid,
+            statusLabel: fallbackServer.status.label,
+          }
+        : null
+    const workbenchContent = createServerWorkbenchContent(detailServer)
+    const sectionContent = workbenchContent[normalizedWorkbenchSection]
+    const renderWorkbenchSection = () => {
+      switch (normalizedWorkbenchSection) {
+        case 'overview':
+          return (
+            <>
+              <div className="workbench-metric-grid">
+                {sectionContent.metrics.map((item) => (
+                  <div className="workbench-metric-card" key={item.label}>
+                    <span className="workbench-metric-label">{item.label}</span>
+                    <strong>{item.value}</strong>
+                    <span className="workbench-metric-meta">{item.meta}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="workbench-content-grid">
+                <div className="card">
+                  <div className="card-header">
+                    <div>
+                      <div className="card-title">工作台提示</div>
+                      <div className="card-subtitle">为后续接入真实功能预留的运营视角卡片。</div>
+                    </div>
+                  </div>
+                  <div className="workbench-note-list">
+                    {sectionContent.highlights.map((item) => (
+                      <div className="workbench-note-card" key={item.title}>
+                        <strong>{item.title}</strong>
+                        <p>{item.body}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="card">
+                  <div className="card-header">
+                    <div>
+                      <div className="card-title">最近动态</div>
+                      <div className="card-subtitle">围绕该服务器的后台占位动态流。</div>
+                    </div>
+                  </div>
+                  <div className="workbench-timeline">
+                    {sectionContent.activity.map((item) => (
+                      <div className="workbench-timeline-item" key={`${item.title}-${item.time}`}>
+                        <div className="workbench-timeline-dot"></div>
+                        <div>
+                          <strong>{item.title}</strong>
+                          <p>{item.detail}</p>
+                          <span>{item.time}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </>
+          )
+        case 'control':
+          return (
+            <div className="workbench-stack">
+              <div className="workbench-control-grid">
+                {sectionContent.actionGroups.map((group) => (
+                  <div className="card" key={group.title}>
+                    <div className="card-header">
+                      <div>
+                        <div className="card-title">{group.title}</div>
+                        <div className="card-subtitle">当前阶段仅提供 UI 结构，按钮不执行实际动作。</div>
+                      </div>
+                    </div>
+                    <div className="workbench-action-grid">
+                      {group.items.map((item) => (
+                        <button className="workbench-action-tile" key={item} type="button">
+                          <span>{item}</span>
+                          <small>开发中</small>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="card">
+                <div className="card-header">
+                  <div>
+                    <div className="card-title">安全约束</div>
+                    <div className="card-subtitle">用于展示未来控制操作的执行规则。</div>
+                  </div>
+                </div>
+                <div className="workbench-bullet-list">
+                  {sectionContent.safety.map((item) => (
+                    <div className="workbench-bullet-item" key={item}>
+                      <span className="workbench-bullet-dot"></span>
+                      {item}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )
+        case 'realtime-logs':
+          return (
+            <div className="workbench-stack">
+              <div className="card">
+                <div className="card-header">
+                  <div>
+                    <div className="card-title">日志连接</div>
+                    <div className="card-subtitle">当前仅为前端伪实时流，后续可直接切换到 WebSocket 或 SSE。</div>
+                  </div>
+                </div>
+                <div className="workbench-log-status-row">
+                  <div className="workbench-log-status-card">
+                    <span>连接状态</span>
+                    <strong>{sectionContent.connectionLabel}</strong>
+                  </div>
+                  <div className="workbench-log-status-card">
+                    <span>日志频道</span>
+                    <strong>{sectionContent.streamName}</strong>
+                  </div>
+                  <div className="workbench-log-status-card">
+                    <span>自动滚动</span>
+                    <strong>{realtimeLogAutoScroll ? '已开启' : '已关闭'}</strong>
+                  </div>
+                </div>
+              </div>
+              <div className="card">
+                <div className="card-header">
+                  <div>
+                    <div className="card-title">日志工具栏</div>
+                    <div className="card-subtitle">支持关键字筛选、级别过滤、暂停和清空视图。</div>
+                  </div>
+                </div>
+                <div className="workbench-log-toolbar">
+                  <div className="table-search workbench-log-search">
+                    <Icon name="search" width={13} height={13} />
+                    <input
+                      type="text"
+                      placeholder="搜索时间、来源、消息内容…"
+                      value={realtimeLogSearchTerm}
+                      onChange={(event) => setRealtimeLogSearchTerm(event.target.value)}
+                    />
+                  </div>
+                  <select
+                    className="filter-select"
+                    value={realtimeLogLevel}
+                    onChange={(event) => setRealtimeLogLevel(event.target.value)}
+                  >
+                    {sectionContent.levelOptions.map((option) => (
+                      <option key={option} value={option}>
+                        {option}
+                      </option>
+                    ))}
+                  </select>
+                  <button className="btn btn-secondary btn-sm" type="button" onClick={() => setRealtimeLogPaused((currentValue) => !currentValue)}>
+                    {realtimeLogPaused ? '恢复滚动' : '暂停滚动'}
+                  </button>
+                  <button className="btn btn-secondary btn-sm" type="button" onClick={() => setRealtimeLogAutoScroll((currentValue) => !currentValue)}>
+                    {realtimeLogAutoScroll ? '关闭自动滚动' : '开启自动滚动'}
+                  </button>
+                  <button className="btn btn-danger btn-sm" type="button" onClick={() => setRealtimeLogEntries([])}>
+                    清空视图
+                  </button>
+                </div>
+                <div className="workbench-log-stream" ref={realtimeLogViewportRef}>
+                  {filteredRealtimeLogEntries.length > 0 ? (
+                    filteredRealtimeLogEntries.map((entry) => (
+                      <div className={`workbench-log-line ${entry.level.toLowerCase()}`} key={entry.id}>
+                        <span className="workbench-log-time">{entry.time}</span>
+                        <span className="workbench-log-level">{entry.level}</span>
+                        <span className="workbench-log-source">{entry.source}</span>
+                        <span className="workbench-log-message">{entry.message}</span>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="workbench-log-empty">当前筛选条件下暂无日志输出。</div>
+                  )}
+                </div>
+                <div className="workbench-log-command">
+                  <input type="text" placeholder={sectionContent.commandPlaceholder} disabled />
+                  <button className="btn btn-primary btn-sm" type="button" disabled>
+                    发送命令
+                  </button>
+                </div>
+              </div>
+            </div>
+          )
+        case 'chat':
+          return (
+            <div className="workbench-stack">
+              <div className="card">
+                <div className="card-header">
+                  <div>
+                    <div className="card-title">聊天筛选</div>
+                    <div className="card-subtitle">后续可接频道、关键词、玩家名筛选。</div>
+                  </div>
+                </div>
+                <div className="workbench-chip-row">
+                  {sectionContent.filters.map((filter) => (
+                    <button className="workbench-chip active" key={filter} type="button">
+                      {filter}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="card">
+                <div className="card-header">
+                  <div>
+                    <div className="card-title">聊天记录</div>
+                    <div className="card-subtitle">使用真实表格结构占位，后续直接接接口数据。</div>
+                  </div>
+                </div>
+                <div className="workbench-table-wrap">
+                  <table className="workbench-table">
+                    <thead>
+                      <tr>
+                        <th>时间</th>
+                        <th>玩家</th>
+                        <th>频道</th>
+                        <th>内容</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sectionContent.rows.map((row) => (
+                        <tr key={`${row.time}-${row.player}`}>
+                          <td>{row.time}</td>
+                          <td>{row.player}</td>
+                          <td>{row.channel}</td>
+                          <td>{row.content}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )
+        case 'flight':
+          return (
+            <div className="workbench-card-grid">
+              {sectionContent.incidents.map((item) => (
+                <div className="card" key={`${item.player}-${item.area}`}>
+                  <div className="card-header">
+                    <div>
+                      <div className="card-title">{item.player}</div>
+                      <div className="card-subtitle">{item.area}</div>
+                    </div>
+                    <span className={`workbench-severity ${item.level === '高' ? 'high' : item.level === '中' ? 'medium' : 'low'}`}>
+                      {item.level}风险
+                    </span>
+                  </div>
+                  <div className="workbench-incident-body">
+                    <p>{item.detail}</p>
+                    <div className="workbench-inline-meta">
+                      <span>状态</span>
+                      <strong>{item.status}</strong>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )
+        case 'knockdown':
+          return (
+            <div className="workbench-stack">
+              <div className="workbench-metric-grid compact">
+                {sectionContent.summary.map((item) => (
+                  <div className="workbench-metric-card" key={item.label}>
+                    <span className="workbench-metric-label">{item.label}</span>
+                    <strong>{item.value}</strong>
+                  </div>
+                ))}
+              </div>
+              <div className="card">
+                <div className="card-header">
+                  <div>
+                    <div className="card-title">击倒事件</div>
+                    <div className="card-subtitle">预留实时战斗记录和热点分析表格。</div>
+                  </div>
+                </div>
+                <div className="workbench-table-wrap">
+                  <table className="workbench-table">
+                    <thead>
+                      <tr>
+                        <th>时间</th>
+                        <th>攻击者</th>
+                        <th>被击倒者</th>
+                        <th>武器</th>
+                        <th>距离</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sectionContent.rows.map((row) => (
+                        <tr key={`${row.time}-${row.attacker}-${row.defender}`}>
+                          <td>{row.time}</td>
+                          <td>{row.attacker}</td>
+                          <td>{row.defender}</td>
+                          <td>{row.weapon}</td>
+                          <td>{row.distance}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )
+        case 'match':
+          return (
+            <div className="workbench-stack">
+              <div className="workbench-metric-grid">
+                {sectionContent.cards.map((item) => (
+                  <div className="workbench-metric-card" key={item.title}>
+                    <span className="workbench-metric-label">{item.title}</span>
+                    <strong>{item.value}</strong>
+                    <span className="workbench-metric-meta">{item.sub}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="card">
+                <div className="card-header">
+                  <div>
+                    <div className="card-title">赛程节点</div>
+                    <div className="card-subtitle">展示回合、赛段和运营准备项。</div>
+                  </div>
+                </div>
+                <div className="workbench-timeline">
+                  {sectionContent.timeline.map((item) => (
+                    <div className="workbench-timeline-item" key={item.title}>
+                      <div className="workbench-timeline-dot"></div>
+                      <div>
+                        <strong>{item.title}</strong>
+                        <p>{item.detail}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )
+        case 'config-files':
+          return (
+            <div className="workbench-config-layout">
+              <div className="card">
+                <div className="card-header">
+                  <div>
+                    <div className="card-title">配置目录</div>
+                    <div className="card-subtitle">未来可接远程文件树与版本控制。</div>
+                  </div>
+                </div>
+                <div className="workbench-file-list">
+                  {sectionContent.files.map((file) => (
+                    <button className="workbench-file-item" key={file.path} type="button">
+                      <div>
+                        <strong>{file.name}</strong>
+                        <span>{file.path}</span>
+                      </div>
+                      <div className="workbench-file-meta">
+                        <span>{file.status}</span>
+                        <span>{file.size}</span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="card">
+                <div className="card-header">
+                  <div>
+                    <div className="card-title">文件预览</div>
+                    <div className="card-subtitle">当前展示的是静态占位代码块。</div>
+                  </div>
+                </div>
+                <pre className="workbench-code-preview">{sectionContent.preview.join('\n')}</pre>
+              </div>
+            </div>
+          )
+        case 'config-panel':
+          return (
+            <div className="workbench-card-grid">
+              {sectionContent.groups.map((group) => (
+                <div className="card" key={group.title}>
+                  <div className="card-header">
+                    <div>
+                      <div className="card-title">{group.title}</div>
+                      <div className="card-subtitle">表单和开关布局已预置，后续接真实配置即可。</div>
+                    </div>
+                  </div>
+                  <div className="workbench-settings-list">
+                    {group.fields.map((field) => (
+                      <div className="workbench-setting-row" key={field}>
+                        <div>
+                          <strong>{field}</strong>
+                          <span>占位配置项</span>
+                        </div>
+                        <button className="workbench-toggle" type="button">
+                          <span></span>
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )
+        case 'operations':
+          return (
+            <div className="card">
+              <div className="card-header">
+                <div>
+                  <div className="card-title">操作审计</div>
+                  <div className="card-subtitle">记录管理员、自动化服务和系统动作的占位视图。</div>
+                </div>
+              </div>
+              <div className="workbench-table-wrap">
+                <table className="workbench-table">
+                  <thead>
+                    <tr>
+                      <th>时间</th>
+                      <th>操作者</th>
+                      <th>动作</th>
+                      <th>结果</th>
+                      <th>目标</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sectionContent.rows.map((row) => (
+                      <tr key={`${row.time}-${row.action}`}>
+                        <td>{row.time}</td>
+                        <td>{row.operator}</td>
+                        <td>{row.action}</td>
+                        <td>{row.result}</td>
+                        <td>{row.target}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )
+        case 'players':
+          return (
+            <div className="workbench-stack">
+              <div className="workbench-metric-grid compact">
+                {sectionContent.cards.map((item) => (
+                  <div className="workbench-metric-card" key={item.label}>
+                    <span className="workbench-metric-label">{item.label}</span>
+                    <strong>{item.value}</strong>
+                    <span className="workbench-metric-meta">{item.sub}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="card">
+                <div className="card-header">
+                  <div>
+                    <div className="card-title">玩家列表</div>
+                    <div className="card-subtitle">用于承接在线状态、标签、黑名单和行为轨迹。</div>
+                  </div>
+                </div>
+                <div className="workbench-player-list">
+                  {sectionContent.rows.map((row) => (
+                    <div className="workbench-player-card" key={row.name}>
+                      <div>
+                        <strong>{row.name}</strong>
+                        <span>{row.level}</span>
+                      </div>
+                      <div>
+                        <strong>{row.status}</strong>
+                        <span>{row.note}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )
+        case 'permissions':
+          return (
+            <div className="workbench-stack">
+              <div className="workbench-card-grid">
+                {sectionContent.roles.map((role) => (
+                  <div className="card" key={role.title}>
+                    <div className="card-header">
+                      <div>
+                        <div className="card-title">{role.title}</div>
+                        <div className="card-subtitle">{role.scope}</div>
+                      </div>
+                    </div>
+                    <div className="workbench-note-card single">
+                      <p>{role.description}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="card">
+                <div className="card-header">
+                  <div>
+                    <div className="card-title">权限矩阵</div>
+                    <div className="card-subtitle">未来可在此接角色继承、批量授权和审批流。</div>
+                  </div>
+                </div>
+                <div className="workbench-table-wrap">
+                  <table className="workbench-table">
+                    <thead>
+                      <tr>
+                        <th>权限项</th>
+                        <th>服主</th>
+                        <th>值班管理员</th>
+                        <th>裁判</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sectionContent.matrix.map((row) => (
+                        <tr key={row.permission}>
+                          <td>{row.permission}</td>
+                          <td>{row.owner ? <Icon name="check" width={14} height={14} /> : '—'}</td>
+                          <td>{row.admin ? <Icon name="check" width={14} height={14} /> : '—'}</td>
+                          <td>{row.referee ? <Icon name="check" width={14} height={14} /> : '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )
+        default:
+          return null
+      }
+    }
+
+    return (
+      <div className="server-workbench">
+        <aside className="card workbench-sidebar">
+          <div className="workbench-server-header">
+            <div className="workbench-server-kicker">服务器工作台</div>
+            <div className="workbench-server-name">{detailServer?.name ?? '服务器详情'}</div>
+            <div className="workbench-server-meta">{detailServer?.ip ?? '--'}:{detailServer?.rconPort ?? '--'}</div>
+            <div className="workbench-server-meta workbench-server-mono">
+              UUID: {detailServer?.serverUuid ?? selectedServerUuid ?? '--'}
+            </div>
+          </div>
+          <div className="workbench-server-summary">
+            <div className="workbench-summary-item">
+              <span>状态</span>
+              <strong>{detailServer?.statusLabel ?? '--'}</strong>
+            </div>
+            <div className="workbench-summary-item">
+              <span>RCON 密码</span>
+              <strong>{detailServer?.rconPassword ? '已配置' : '未设置'}</strong>
+            </div>
+          </div>
+          <div className="workbench-nav">
+            {SERVER_WORKBENCH_SECTIONS.map((section) => (
+              <button
+                className={`workbench-nav-item${normalizedWorkbenchSection === section.id ? ' active' : ''}`}
+                key={section.id}
+                type="button"
+                onClick={() => setActiveWorkbenchSection(section.id)}
+              >
+                <Icon name={section.icon} width={15} height={15} />
+                <span>{section.label}</span>
+              </button>
+            ))}
+          </div>
+        </aside>
+        <div className="workbench-main">
+          <div className="card">
+            <div className="card-header">
+              <div>
+                <div className="card-title">{activeWorkbenchSectionConfig.label}</div>
+                <div className="card-subtitle">{activeWorkbenchSectionConfig.description}</div>
+              </div>
+              <div className="server-detail-actions">
+                <button className="btn btn-secondary btn-sm" type="button" onClick={handleBackToServerList}>
+                  <Icon name="arrow-left" width={13} height={13} />
+                  返回列表
+                </button>
+                {fallbackServer ? (
+                  <>
+                    <button className="btn btn-secondary btn-sm" type="button" onClick={() => handleEditServer(fallbackServer)}>
+                      <Icon name="pencil" width={13} height={13} />
+                      编辑服务器
+                    </button>
+                    <button className="btn btn-danger btn-sm" type="button" onClick={() => handleDeleteServer(fallbackServer)}>
+                      <Icon name="trash" width={13} height={13} />
+                      删除服务器
+                    </button>
+                  </>
+                ) : null}
+              </div>
+            </div>
+            {isServerDetailLoading ? <div className="server-detail-banner">正在同步服务器详情…</div> : null}
+            {serverDetailError ? <div className="server-detail-banner error">{serverDetailError}</div> : null}
+            {detailServer ? (
+              <div className="workbench-section-body">{renderWorkbenchSection()}</div>
+            ) : (
+              <div className="server-detail-empty">
+                <EmptyState message="未找到服务器详情，请返回列表后重试。" />
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   const renderDashboardView = () => (
     <>
@@ -1090,7 +2062,11 @@ function App() {
     </>
   )
 
-  const renderServerManagerView = () => <div className="server-manager-layout">{renderServerTableCard()}</div>
+  const renderServerManagerView = () => (
+    <div className="server-manager-layout">
+      {serverManagementPage.mode === 'detail' ? renderServerDetailView() : renderServerTableCard()}
+    </div>
+  )
 
   return (
     <>
@@ -1172,7 +2148,7 @@ function App() {
             </span>
           </div>
           <div className="header-right">
-            <span className="status-live" style={{ padding: '0 8px' }}>
+            <span className={`status-live ${connectionStatus.tone}`} style={{ padding: '0 8px' }}>
               <span className="status-live-dot"></span> {headerLiveLabel}
             </span>
             <div className="divider-v"></div>
@@ -1205,7 +2181,17 @@ function App() {
         </header>
 
         <main className="content">
-          {flashMessage ? <div className={`flash-message ${flashMessage.type}`}>{flashMessage.text}</div> : null}
+          {dashboardLoadError ? (
+            <div className="flash-message error">
+              <div>{dashboardLoadError}</div>
+            </div>
+          ) : null}
+          {flashMessage ? (
+            <div className={`flash-message ${flashMessage.type}`}>
+              <div>{flashMessage.text}</div>
+              {flashMessage.serverUuid ? <div className="flash-message-detail">UUID: {flashMessage.serverUuid}</div> : null}
+            </div>
+          ) : null}
           <div className="page-header">
             <div>
               <div className="page-title">{currentPageTitle}</div>
@@ -1218,17 +2204,26 @@ function App() {
                 <Icon name="refresh" width={13} height={13} />
                 {dashboard.page.refreshLabel}
               </button>
-              <button className="btn btn-primary btn-sm" type="button" onClick={handleAddServer}>
-                <Icon name="plus" width={13} height={13} />
-                {dashboard.page.addServerLabel}
-              </button>
+              {activeView !== 'server-detail' ? (
+                <button className="btn btn-primary btn-sm" type="button" onClick={handleAddServer}>
+                  <Icon name="plus" width={13} height={13} />
+                  {dashboard.page.addServerLabel}
+                </button>
+              ) : null}
             </div>
           </div>
-          {activeView === 'server-manager' ? renderServerManagerView() : renderDashboardView()}
+          {activeView === 'server-manager' || activeView === 'server-detail' ? renderServerManagerView() : renderDashboardView()}
         </main>
       </div>
-      {isAddServerModalOpen ? (
+      {isServerFormModalOpen ? (
         <AddServerModal
+          title={serverFormMode === 'edit' ? '编辑服务器' : '添加服务器'}
+          subtitle={
+            serverFormMode === 'edit'
+              ? '更新服务器信息后，系统会重新进行 RCON 验证。'
+              : '录入服务器信息后，系统会先进行 RCON 验证。'
+          }
+          submitLabel={serverFormMode === 'edit' ? '保存并验证' : '验证并添加'}
           form={serverForm}
           submitting={serverFormSubmitting}
           error={serverFormError}
@@ -1237,10 +2232,25 @@ function App() {
             if (serverFormSubmitting) {
               return
             }
-            setIsAddServerModalOpen(false)
-            setServerFormError('')
+            setIsServerFormModalOpen(false)
+            resetServerForm()
           }}
           onSubmit={handleServerFormSubmit}
+        />
+      ) : null}
+      {deleteTargetServer ? (
+        <DeleteServerModal
+          server={deleteTargetServer}
+          submitting={deleteServerSubmitting}
+          error={deleteServerError}
+          onClose={() => {
+            if (deleteServerSubmitting) {
+              return
+            }
+            setDeleteTargetServer(null)
+            setDeleteServerError('')
+          }}
+          onConfirm={handleDeleteServerConfirm}
         />
       ) : null}
     </>

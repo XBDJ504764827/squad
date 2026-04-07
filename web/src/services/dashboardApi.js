@@ -1,4 +1,29 @@
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '/api'
+export function normalizeApiBaseUrl(value) {
+  const normalizedValue = value?.trim()
+
+  if (!normalizedValue) {
+    return '/api'
+  }
+
+  return normalizedValue.replace(/\/+$/, '') || '/api'
+}
+
+export async function extractErrorMessage(response) {
+  let message = `API request failed: ${response.status}`
+
+  try {
+    const errorPayload = await response.json()
+    if (typeof errorPayload?.message === 'string' && errorPayload.message.trim() !== '') {
+      message = errorPayload.message
+    }
+  } catch {
+    // Ignore JSON parsing failures for non-JSON error responses.
+  }
+
+  return message
+}
+
+const API_BASE_URL = normalizeApiBaseUrl(import.meta.env?.VITE_API_BASE_URL)
 
 async function request(path, options = {}) {
   const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -10,18 +35,7 @@ async function request(path, options = {}) {
   })
 
   if (!response.ok) {
-    let message = `API request failed: ${response.status}`
-
-    try {
-      const errorPayload = await response.json()
-      if (typeof errorPayload?.message === 'string') {
-        message = errorPayload.message
-      }
-    } catch {
-      // Ignore JSON parsing failures for non-JSON error responses.
-    }
-
-    throw new Error(message)
+    throw new Error(await extractErrorMessage(response))
   }
 
   if (response.status === 204) {
@@ -38,10 +52,24 @@ export const dashboardApi = {
   async getHealth() {
     return request('/health')
   },
+  async getServer(serverUuid) {
+    return request(`/servers/${serverUuid}`)
+  },
   async addServer(payload) {
     return request('/servers', {
       method: 'POST',
       body: JSON.stringify(payload),
+    })
+  },
+  async updateServer(serverUuid, payload) {
+    return request(`/servers/${serverUuid}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    })
+  },
+  async deleteServer(serverUuid) {
+    return request(`/servers/${serverUuid}`, {
+      method: 'DELETE',
     })
   },
   actions: {

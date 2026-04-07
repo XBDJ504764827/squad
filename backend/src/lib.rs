@@ -1,0 +1,467 @@
+pub mod models;
+pub mod rcon;
+
+use std::{env, net::SocketAddr, path::Path};
+
+use axum::{
+    Json, Router,
+    extract::{Path as AxumPath, State},
+    http::StatusCode,
+    routing::{get, post},
+};
+use dotenvy::from_path_override;
+use models::{
+    ActionResponse, AddServerRequest, DashboardResponse, ErrorResponse, HealthResponse,
+    ManagedServer, ManagedServerDetailResponse, UpdateServerRequest,
+};
+use sqlx::{PgPool, postgres::PgPoolOptions};
+use tower_http::cors::{Any, CorsLayer};
+use uuid::Uuid;
+
+#[derive(Clone)]
+struct AppState {
+    db: PgPool,
+}
+
+struct AppConfig {
+    database_url: String,
+    port: u16,
+    database_max_connections: u32,
+}
+
+pub async fn run() {
+    let env_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
+    from_path_override(&env_path).ok();
+
+    let config = AppConfig::from_env();
+
+    let db = PgPoolOptions::new()
+        .max_connections(config.database_max_connections)
+        .connect(&config.database_url)
+        .await
+        .expect("failed to connect to PostgreSQL");
+
+    initialize_database(&db)
+        .await
+        .expect("failed to initialize PostgreSQL schema");
+
+    let app = build_app(db);
+
+    let address = SocketAddr::from(([127, 0, 0, 1], config.port));
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .expect("failed to bind TCP listener");
+
+    println!("Rust backend listening on http://{}", address);
+
+    axum::serve(listener, app)
+        .await
+        .expect("backend server exited unexpectedly");
+}
+
+pub fn build_app(db: PgPool) -> Router {
+    Router::new()
+        .route("/api/health", get(health))
+        .route("/api/dashboard", get(dashboard))
+        .route("/api/servers", post(add_server))
+        .route(
+            "/api/servers/{server_uuid}",
+            get(get_server).put(update_server).delete(delete_server),
+        )
+        .with_state(AppState { db })
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
+}
+
+impl AppConfig {
+    fn from_env() -> Self {
+        Self {
+            database_url: env::var("DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://squad:squad@127.0.0.1:5432/squad".to_string()),
+            port: read_env_or_default("PORT", 3000),
+            database_max_connections: read_env_or_default("DATABASE_MAX_CONNECTIONS", 10),
+        }
+    }
+}
+
+fn read_env_or_default<T>(key: &str, default: T) -> T
+where
+    T: std::str::FromStr + Copy,
+{
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<T>().ok())
+        .unwrap_or(default)
+}
+
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok".to_string(),
+    })
+}
+
+async fn dashboard(
+    State(state): State<AppState>,
+) -> Result<Json<DashboardResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let servers = fetch_servers(&state.db)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器列表失败"))?;
+
+    Ok(Json(DashboardResponse::from_servers(&servers)))
+}
+
+async fn get_server(
+    AxumPath(server_uuid): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<ManagedServerDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let server = fetch_server_by_uuid(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器详情失败"))?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "服务器不存在"))?;
+
+    Ok(Json(ManagedServerDetailResponse::from_server(&server)))
+}
+
+async fn add_server(
+    State(state): State<AppState>,
+    Json(payload): Json<AddServerRequest>,
+) -> Result<Json<ActionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let name = payload.name.trim().to_string();
+    let ip = payload.ip.trim().to_string();
+    let password = payload.rcon_password.trim().to_string();
+
+    validate_server_payload(&name, &ip, payload.rcon_port, &password)?;
+
+    let duplicate_exists = server_exists_for_other(&state.db, &name, &ip, payload.rcon_port, None)
+        .await
+        .map_err(|_| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "检查服务器是否重复时失败",
+            )
+        })?;
+
+    if duplicate_exists {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "服务器名称或服务器地址已存在，请勿重复添加",
+        ));
+    }
+
+    rcon::validate_rcon_credentials(&ip, payload.rcon_port, &password)
+        .await
+        .map_err(|message| error_response(StatusCode::BAD_REQUEST, &message))?;
+
+    let server_uuid = insert_server(&state.db, &name, &ip, payload.rcon_port, &password)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "服务器写入数据库失败"))?;
+
+    Ok(Json(ActionResponse {
+        message: "服务器添加成功，RCON 验证已通过".to_string(),
+        server_uuid,
+    }))
+}
+
+async fn update_server(
+    AxumPath(server_uuid): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<UpdateServerRequest>,
+) -> Result<Json<ActionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let name = payload.name.trim().to_string();
+    let ip = payload.ip.trim().to_string();
+    let password = payload.rcon_password.trim().to_string();
+
+    validate_server_payload(&name, &ip, payload.rcon_port, &password)?;
+
+    let existing_server = fetch_server_by_uuid(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器详情失败"))?;
+
+    if existing_server.is_none() {
+        return Err(error_response(StatusCode::NOT_FOUND, "服务器不存在"));
+    }
+
+    let duplicate_exists =
+        server_exists_for_other(&state.db, &name, &ip, payload.rcon_port, Some(&server_uuid))
+            .await
+            .map_err(|_| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "检查服务器是否重复时失败",
+                )
+            })?;
+
+    if duplicate_exists {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "服务器名称或服务器地址已存在，请勿重复修改",
+        ));
+    }
+
+    rcon::validate_rcon_credentials(&ip, payload.rcon_port, &password)
+        .await
+        .map_err(|message| error_response(StatusCode::BAD_REQUEST, &message))?;
+
+    let updated = update_server_record(&state.db, &server_uuid, &name, &ip, payload.rcon_port, &password)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "服务器更新失败"))?;
+
+    if !updated {
+        return Err(error_response(StatusCode::NOT_FOUND, "服务器不存在"));
+    }
+
+    Ok(Json(ActionResponse {
+        message: "服务器更新成功，RCON 验证已通过".to_string(),
+        server_uuid,
+    }))
+}
+
+async fn delete_server(
+    AxumPath(server_uuid): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<ActionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let deleted = delete_server_record(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "删除服务器失败"))?;
+
+    if !deleted {
+        return Err(error_response(StatusCode::NOT_FOUND, "服务器不存在"));
+    }
+
+    Ok(Json(ActionResponse {
+        message: "服务器删除成功".to_string(),
+        server_uuid,
+    }))
+}
+
+fn validate_server_payload(
+    name: &str,
+    ip: &str,
+    rcon_port: u16,
+    password: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if name.is_empty() || ip.is_empty() || password.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "服务器名称、IP、RCON 端口和 RCON 密码不能为空",
+        ));
+    }
+
+    if rcon_port == 0 {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "RCON 端口必须大于 0",
+        ));
+    }
+
+    Ok(())
+}
+
+async fn initialize_database(db: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS managed_servers (
+            id BIGSERIAL PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            ip TEXT NOT NULL,
+            rcon_port INTEGER NOT NULL,
+            rcon_password TEXT NOT NULL,
+            server_uuid TEXT NOT NULL UNIQUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (ip, rcon_port)
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        ALTER TABLE managed_servers
+        ADD COLUMN IF NOT EXISTS server_uuid TEXT
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    let missing_uuid_server_ids = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT id
+        FROM managed_servers
+        WHERE server_uuid IS NULL OR server_uuid = ''
+        "#,
+    )
+    .fetch_all(db)
+    .await?;
+
+    for server_id in missing_uuid_server_ids {
+        sqlx::query(
+            r#"
+            UPDATE managed_servers
+            SET server_uuid = $1
+            WHERE id = $2
+            "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(server_id)
+        .execute(db)
+        .await?;
+    }
+
+    sqlx::query(
+        r#"
+        ALTER TABLE managed_servers
+        ALTER COLUMN server_uuid SET NOT NULL
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS managed_servers_server_uuid_idx
+        ON managed_servers (server_uuid)
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+async fn fetch_servers(db: &PgPool) -> Result<Vec<ManagedServer>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, ManagedServer>(
+        r#"
+        SELECT name, ip, rcon_port, server_uuid, rcon_password
+        FROM managed_servers
+        ORDER BY created_at DESC, id DESC
+        "#,
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows)
+}
+
+async fn fetch_server_by_uuid(
+    db: &PgPool,
+    server_uuid: &str,
+) -> Result<Option<ManagedServer>, sqlx::Error> {
+    sqlx::query_as::<_, ManagedServer>(
+        r#"
+        SELECT name, ip, rcon_port, server_uuid, rcon_password
+        FROM managed_servers
+        WHERE server_uuid = $1
+        "#,
+    )
+    .bind(server_uuid)
+    .fetch_optional(db)
+    .await
+}
+
+async fn server_exists_for_other(
+    db: &PgPool,
+    name: &str,
+    ip: &str,
+    rcon_port: u16,
+    excluded_server_uuid: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let existing = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM managed_servers
+        WHERE (name = $1 OR (ip = $2 AND rcon_port = $3))
+          AND ($4::TEXT IS NULL OR server_uuid <> $4)
+        "#,
+    )
+    .bind(name)
+    .bind(ip)
+    .bind(i32::from(rcon_port))
+    .bind(excluded_server_uuid)
+    .fetch_one(db)
+    .await?;
+
+    Ok(existing > 0)
+}
+
+async fn insert_server(
+    db: &PgPool,
+    name: &str,
+    ip: &str,
+    rcon_port: u16,
+    rcon_password: &str,
+) -> Result<String, sqlx::Error> {
+    let server_uuid = Uuid::new_v4().to_string();
+
+    sqlx::query(
+        r#"
+        INSERT INTO managed_servers (name, ip, rcon_port, rcon_password, server_uuid)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(name)
+    .bind(ip)
+    .bind(i32::from(rcon_port))
+    .bind(rcon_password)
+    .bind(&server_uuid)
+    .execute(db)
+    .await?;
+
+    Ok(server_uuid)
+}
+
+async fn update_server_record(
+    db: &PgPool,
+    server_uuid: &str,
+    name: &str,
+    ip: &str,
+    rcon_port: u16,
+    rcon_password: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        UPDATE managed_servers
+        SET name = $1,
+            ip = $2,
+            rcon_port = $3,
+            rcon_password = $4
+        WHERE server_uuid = $5
+        "#,
+    )
+    .bind(name)
+    .bind(ip)
+    .bind(i32::from(rcon_port))
+    .bind(rcon_password)
+    .bind(server_uuid)
+    .execute(db)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+async fn delete_server_record(db: &PgPool, server_uuid: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM managed_servers
+        WHERE server_uuid = $1
+        "#,
+    )
+    .bind(server_uuid)
+    .execute(db)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+fn error_response(status: StatusCode, message: &str) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        status,
+        Json(ErrorResponse {
+            message: message.to_string(),
+        }),
+    )
+}
