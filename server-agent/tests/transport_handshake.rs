@@ -1,9 +1,9 @@
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use server_agent::{
-    AgentClientMessage, AgentCommand, AgentCommandHandler, AgentCommandResult, AgentHeartbeat,
-    AgentPlatform, AgentRegistered, AgentRegistration, AgentServerMessage, Transport,
-    WorkspaceRootSummary,
+    AgentClientMessage, AgentCommand, AgentCommandHandler, AgentCommandResult, AgentFileChanged,
+    AgentHeartbeat, AgentLogChunk, AgentPlatform, AgentRegistered, AgentRegistration,
+    AgentServerMessage, LogEnvelope, Transport, WorkspaceRootSummary,
 };
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -49,7 +49,10 @@ async fn connect_sends_registration_and_waits_for_registered_ack() {
                 assert_eq!(payload.token, "test-token");
                 assert_eq!(payload.workspace_roots[0].logical_path, "/game-root");
             }
-            AgentClientMessage::Heartbeat(_) | AgentClientMessage::CommandResult(_) => {
+            AgentClientMessage::Heartbeat(_)
+            | AgentClientMessage::CommandResult(_)
+            | AgentClientMessage::LogChunk(_)
+            | AgentClientMessage::FileChanged(_) => {
                 panic!("unexpected message before registration ack")
             }
         }
@@ -234,6 +237,140 @@ async fn connection_receives_command_and_sends_command_result() {
     server.await.expect("server should finish");
 }
 
+#[tokio::test]
+async fn connection_can_send_log_chunk_after_registration() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("local addr");
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut socket = accept_async(stream).await.expect("upgrade");
+
+        let _ = socket
+            .next()
+            .await
+            .expect("register frame")
+            .expect("register frame readable");
+
+        let ack = AgentRegistered {
+            agent_id: "agent-1".to_string(),
+            session_id: "session-1".to_string(),
+        };
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&AgentServerMessage::Registered(ack))
+                    .expect("ack json")
+                    .into(),
+            ))
+            .await
+            .expect("ack should send");
+
+        let log_chunk = socket
+            .next()
+            .await
+            .expect("log frame")
+            .expect("log readable");
+        let message = serde_json::from_str::<AgentClientMessage>(
+            log_chunk.into_text().expect("log text").as_ref(),
+        )
+        .expect("log json");
+
+        match message {
+            AgentClientMessage::LogChunk(payload) => {
+                assert_eq!(payload.entries.len(), 1);
+                assert_eq!(payload.entries[0].raw_line, "server started");
+            }
+            other => panic!("unexpected client message: {other:?}"),
+        }
+    });
+
+    let transport = Transport::new(format!("ws://{address}"));
+    let mut connection = transport
+        .connect(make_registration())
+        .await
+        .expect("handshake should succeed");
+    connection
+        .send_log_chunk(AgentLogChunk {
+            entries: vec![LogEnvelope {
+                agent_id: "agent-1".to_string(),
+                source: "server".to_string(),
+                cursor: "1".to_string(),
+                line_number: 1,
+                raw_line: "server started".to_string(),
+                observed_at: "1".to_string(),
+            }],
+        })
+        .await
+        .expect("log chunk should send");
+
+    server.await.expect("server should finish");
+}
+
+#[tokio::test]
+async fn connection_can_send_file_change_after_registration() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("local addr");
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut socket = accept_async(stream).await.expect("upgrade");
+
+        let _ = socket
+            .next()
+            .await
+            .expect("register frame")
+            .expect("register frame readable");
+
+        let ack = AgentRegistered {
+            agent_id: "agent-1".to_string(),
+            session_id: "session-1".to_string(),
+        };
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&AgentServerMessage::Registered(ack))
+                    .expect("ack json")
+                    .into(),
+            ))
+            .await
+            .expect("ack should send");
+
+        let file_changed = socket
+            .next()
+            .await
+            .expect("file frame")
+            .expect("file readable");
+        let message = serde_json::from_str::<AgentClientMessage>(
+            file_changed.into_text().expect("file text").as_ref(),
+        )
+        .expect("file json");
+
+        match message {
+            AgentClientMessage::FileChanged(payload) => {
+                assert_eq!(payload.logical_path, "/game-root/server.cfg");
+            }
+            other => panic!("unexpected client message: {other:?}"),
+        }
+    });
+
+    let transport = Transport::new(format!("ws://{address}"));
+    let mut connection = transport
+        .connect(make_registration())
+        .await
+        .expect("handshake should succeed");
+    connection
+        .send_file_changed(AgentFileChanged {
+            logical_path: "/game-root/server.cfg".to_string(),
+        })
+        .await
+        .expect("file change should send");
+
+    server.await.expect("server should finish");
+}
+
 #[derive(Default)]
 struct TestCommandHandler;
 
@@ -244,9 +381,9 @@ impl AgentCommandHandler for TestCommandHandler {
     ) -> Result<Option<Value>, server_agent::AgentError> {
         match command {
             AgentCommand::Ping => Ok(Some(json!({ "pong": true }))),
-            AgentCommand::FileTree(_)
-            | AgentCommand::FileRead(_)
-            | AgentCommand::FileWrite(_) => Ok(None),
+            AgentCommand::FileTree(_) | AgentCommand::FileRead(_) | AgentCommand::FileWrite(_) => {
+                Ok(None)
+            }
         }
     }
 }

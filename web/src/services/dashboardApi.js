@@ -45,6 +45,10 @@ async function request(path, options = {}) {
   return response.json()
 }
 
+function buildAgentPath(agentId, path) {
+  return `/agents/${encodeURIComponent(agentId)}${path}`
+}
+
 export const dashboardApi = {
   async getDashboardData() {
     return request('/dashboard')
@@ -71,6 +75,21 @@ export const dashboardApi = {
     return request(`/servers/${serverUuid}`, {
       method: 'DELETE',
     })
+  },
+  async getAgentFileTree(agentId, logicalPath) {
+    return request(`${buildAgentPath(agentId, `/files/tree?path=${encodeURIComponent(logicalPath)}`)}`)
+  },
+  async getAgentFileContent(agentId, logicalPath) {
+    return request(`${buildAgentPath(agentId, `/files/content?path=${encodeURIComponent(logicalPath)}`)}`)
+  },
+  async updateAgentFileContent(agentId, payload) {
+    return request(buildAgentPath(agentId, '/files/content'), {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    })
+  },
+  openAgentEvents(agentId, { EventSourceCtor = globalThis.EventSource } = {}) {
+    return new EventSourceCtor(`${API_BASE_URL}${buildAgentPath(agentId, '/events')}`)
   },
   actions: {
     async onAddServer() {},

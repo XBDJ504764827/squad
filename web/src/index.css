@@ -1301,6 +1301,10 @@ a { text-decoration: none; color: inherit; }
   gap: 16px;
   text-align: left;
 }
+.workbench-file-item.active {
+  border-color: rgba(14, 165, 233, 0.4);
+  box-shadow: 0 0 0 1px rgba(14, 165, 233, 0.18);
+}
 .workbench-file-item strong,
 .workbench-player-card strong,
 .workbench-setting-row strong {
@@ -1329,6 +1333,15 @@ a { text-decoration: none; color: inherit; }
   line-height: 1.7;
   font-family: 'DM Mono', monospace;
   overflow-x: auto;
+}
+.workbench-code-editor {
+  width: calc(100% - 40px);
+  min-height: 420px;
+  border: none;
+  resize: vertical;
+}
+.workbench-inline-error {
+  margin: 0 20px 16px;
 }
 .workbench-settings-list {
   padding: 0 20px 20px;

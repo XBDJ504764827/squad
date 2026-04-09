@@ -5,12 +5,13 @@ import { createEmptyDashboardData } from './data/defaultDashboard'
 import { dashboardApi } from './services/dashboardApi'
 import { buildServerManagementPage, buildServerViewAfterDelete } from './services/serverManagementView'
 import {
-  appendRealtimeLogEntry,
-  createInitialRealtimeLogs,
   DEFAULT_WORKBENCH_SECTION,
   SERVER_WORKBENCH_SECTIONS,
+  appendAgentLogChunk,
+  buildConfigFileItems,
   createServerWorkbenchContent,
   filterRealtimeLogEntries,
+  normalizeAgentStreamEvent,
   normalizeWorkbenchSection,
 } from './services/serverWorkbench'
 
@@ -589,11 +590,12 @@ function App() {
   const [activeView, setActiveView] = useState('dashboard')
   const [selectedServerUuid, setSelectedServerUuid] = useState(null)
   const [activeWorkbenchSection, setActiveWorkbenchSection] = useState(DEFAULT_WORKBENCH_SECTION)
-  const [realtimeLogEntries, setRealtimeLogEntries] = useState(() => createInitialRealtimeLogs('GamePanel'))
+  const [realtimeLogEntries, setRealtimeLogEntries] = useState([])
   const [realtimeLogLevel, setRealtimeLogLevel] = useState('ALL')
   const [realtimeLogSearchTerm, setRealtimeLogSearchTerm] = useState('')
   const [realtimeLogPaused, setRealtimeLogPaused] = useState(false)
   const [realtimeLogAutoScroll, setRealtimeLogAutoScroll] = useState(true)
+  const [realtimeLogConnectionLabel, setRealtimeLogConnectionLabel] = useState('等待连接')
   const [currentTime, setCurrentTime] = useState(() => formatCurrentTime())
   const [globalSearch, setGlobalSearch] = useState('')
   const [tableSearch, setTableSearch] = useState('')
@@ -624,7 +626,18 @@ function App() {
     tone: 'loading',
     label: '连接中',
   })
+  const [configFileItems, setConfigFileItems] = useState([])
+  const [selectedConfigFilePath, setSelectedConfigFilePath] = useState('')
+  const [configFileContent, setConfigFileContent] = useState('')
+  const [configFileDraft, setConfigFileDraft] = useState('')
+  const [configFileVersion, setConfigFileVersion] = useState('')
+  const [configFileLoading, setConfigFileLoading] = useState(false)
+  const [configFileSaving, setConfigFileSaving] = useState(false)
+  const [configFileError, setConfigFileError] = useState('')
+  const [configFileRefreshToken, setConfigFileRefreshToken] = useState(0)
   const realtimeLogViewportRef = useRef(null)
+  const selectedConfigFilePathRef = useRef('')
+  const configFileDirtyRef = useRef(false)
   const normalizedWorkbenchSection = normalizeWorkbenchSection(activeWorkbenchSection)
   const activeWorkbenchSectionConfig = SERVER_WORKBENCH_SECTIONS.find(
     (section) => section.id === normalizedWorkbenchSection,
@@ -634,6 +647,7 @@ function App() {
     activeView,
     selectedServerUuid,
   })
+  const isConfigFileDirty = configFileDraft !== configFileContent
 
   const applyDashboardPayload = (payload) => {
     setDashboard(payload)
@@ -747,39 +761,188 @@ function App() {
   }, [])
 
   useEffect(() => {
-    const logServerName = managedServerDetail?.name ?? serverManagementPage.server?.name ?? 'GamePanel'
-    setRealtimeLogEntries(createInitialRealtimeLogs(logServerName))
+    setRealtimeLogEntries([])
     setRealtimeLogLevel('ALL')
     setRealtimeLogSearchTerm('')
     setRealtimeLogPaused(false)
     setRealtimeLogAutoScroll(true)
-  }, [managedServerDetail?.name, serverManagementPage.server?.name, selectedServerUuid])
+    setRealtimeLogConnectionLabel('等待连接')
+    setConfigFileItems([])
+    setSelectedConfigFilePath('')
+    setConfigFileContent('')
+    setConfigFileDraft('')
+    setConfigFileVersion('')
+    setConfigFileError('')
+    setConfigFileRefreshToken(0)
+  }, [managedServerDetail?.agentId, selectedServerUuid])
 
   useEffect(() => {
-    if (activeView !== 'server-detail' || normalizedWorkbenchSection !== 'realtime-logs' || realtimeLogPaused) {
-      return undefined
-    }
-
-    const logServerName = managedServerDetail?.name ?? serverManagementPage.server?.name ?? 'GamePanel'
-    const intervalId = window.setInterval(() => {
-      setRealtimeLogEntries((currentEntries) => appendRealtimeLogEntry(currentEntries, logServerName))
-    }, 1400)
-
-    return () => {
-      window.clearInterval(intervalId)
-    }
-  }, [
-    activeView,
-    normalizedWorkbenchSection,
-    realtimeLogPaused,
-    managedServerDetail?.name,
-    serverManagementPage.server?.name,
-  ])
+    selectedConfigFilePathRef.current = selectedConfigFilePath
+    configFileDirtyRef.current = isConfigFileDirty
+  }, [selectedConfigFilePath, isConfigFileDirty])
 
   const filteredRealtimeLogEntries = filterRealtimeLogEntries(realtimeLogEntries, {
     level: realtimeLogLevel,
     searchTerm: realtimeLogSearchTerm,
   })
+
+  useEffect(() => {
+    if (activeView !== 'server-detail' || !managedServerDetail?.agentId) {
+      return undefined
+    }
+
+    const rootPath = managedServerDetail.workspaceRoots?.[0]?.logicalPath
+    if (!rootPath) {
+      setConfigFileItems([])
+      setSelectedConfigFilePath('')
+      return undefined
+    }
+
+    let cancelled = false
+
+    async function loadConfigTree() {
+      try {
+        const payload = await dashboardApi.getAgentFileTree(managedServerDetail.agentId, rootPath)
+        if (cancelled) {
+          return
+        }
+
+        const nextItems = buildConfigFileItems(payload.entries ?? [])
+        setConfigFileItems(nextItems)
+        setConfigFileError('')
+        setSelectedConfigFilePath((currentPath) => {
+          if (currentPath && nextItems.some((item) => item.path === currentPath && !item.isDir)) {
+            return currentPath
+          }
+
+          return nextItems.find((item) => !item.isDir)?.path ?? ''
+        })
+      } catch (error) {
+        if (cancelled) {
+          return
+        }
+
+        setConfigFileItems([])
+        setSelectedConfigFilePath('')
+        setConfigFileError(error instanceof Error ? error.message : '读取配置目录失败')
+      }
+    }
+
+    loadConfigTree()
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeView, managedServerDetail?.agentId, managedServerDetail?.workspaceRoots, configFileRefreshToken])
+
+  useEffect(() => {
+    if (activeView !== 'server-detail' || !managedServerDetail?.agentId || !selectedConfigFilePath) {
+      return undefined
+    }
+
+    const selectedItem = configFileItems.find((item) => item.path === selectedConfigFilePath)
+    if (selectedItem?.isDir) {
+      return undefined
+    }
+
+    let cancelled = false
+
+    async function loadConfigFile() {
+      setConfigFileLoading(true)
+
+      try {
+        const payload = await dashboardApi.getAgentFileContent(
+          managedServerDetail.agentId,
+          selectedConfigFilePath,
+        )
+        if (cancelled) {
+          return
+        }
+
+        setConfigFileContent(payload.content ?? '')
+        setConfigFileDraft(payload.content ?? '')
+        setConfigFileVersion(payload.version ?? '')
+        setConfigFileError('')
+      } catch (error) {
+        if (cancelled) {
+          return
+        }
+
+        setConfigFileContent('')
+        setConfigFileDraft('')
+        setConfigFileVersion('')
+        setConfigFileError(error instanceof Error ? error.message : '读取文件内容失败')
+      } finally {
+        if (!cancelled) {
+          setConfigFileLoading(false)
+        }
+      }
+    }
+
+    loadConfigFile()
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeView, managedServerDetail?.agentId, selectedConfigFilePath, configFileItems, configFileRefreshToken])
+
+  useEffect(() => {
+    if (activeView !== 'server-detail' || !managedServerDetail?.agentId) {
+      return undefined
+    }
+
+    let eventSource
+
+    try {
+      eventSource = dashboardApi.openAgentEvents(managedServerDetail.agentId)
+      setRealtimeLogConnectionLabel('连接中')
+    } catch {
+      setRealtimeLogConnectionLabel('当前环境不支持 SSE')
+      return undefined
+    }
+
+    const handleLogChunk = (event) => {
+      const normalizedEvent = normalizeAgentStreamEvent(event.type, event.data)
+      if (!normalizedEvent || normalizedEvent.type !== 'logChunk') {
+        return
+      }
+
+      setRealtimeLogConnectionLabel('已连接日志频道')
+      if (realtimeLogPaused) {
+        return
+      }
+
+      setRealtimeLogEntries((currentEntries) =>
+        appendAgentLogChunk(currentEntries, normalizedEvent.payload, managedServerDetail.name ?? 'GamePanel'))
+    }
+
+    const handleFileChanged = (event) => {
+      const normalizedEvent = normalizeAgentStreamEvent(event.type, event.data)
+      if (!normalizedEvent || normalizedEvent.type !== 'fileChanged') {
+        return
+      }
+
+      setConfigFileRefreshToken((currentValue) => currentValue + 1)
+      if (normalizedEvent.payload.logicalPath === selectedConfigFilePathRef.current) {
+        if (configFileDirtyRef.current) {
+          setConfigFileError(`文件已在远端变更：${normalizedEvent.payload.logicalPath}`)
+          return
+        }
+
+        setConfigFileRefreshToken((currentValue) => currentValue + 1)
+      }
+    }
+
+    eventSource.addEventListener('agent.logChunk', handleLogChunk)
+    eventSource.addEventListener('agent.fileChanged', handleFileChanged)
+    eventSource.onerror = () => {
+      setRealtimeLogConnectionLabel('连接中断')
+    }
+
+    return () => {
+      eventSource.close()
+    }
+  }, [activeView, managedServerDetail?.agentId, managedServerDetail?.name, realtimeLogPaused])
 
   useEffect(() => {
     if (!realtimeLogAutoScroll || normalizedWorkbenchSection !== 'realtime-logs') {
@@ -853,6 +1016,30 @@ function App() {
       )
     } finally {
       setIsLoading(false)
+    }
+  }
+
+  const handleSaveConfigFile = async () => {
+    if (!managedServerDetail?.agentId || !selectedConfigFilePath) {
+      return
+    }
+
+    setConfigFileSaving(true)
+    setConfigFileError('')
+
+    try {
+      const payload = await dashboardApi.updateAgentFileContent(managedServerDetail.agentId, {
+        logicalPath: selectedConfigFilePath,
+        content: configFileDraft,
+        expectedVersion: configFileVersion || null,
+      })
+      setConfigFileContent(configFileDraft)
+      setConfigFileVersion(payload.version ?? '')
+      setConfigFileRefreshToken((currentValue) => currentValue + 1)
+    } catch (error) {
+      setConfigFileError(error instanceof Error ? error.message : '保存配置文件失败')
+    } finally {
+      setConfigFileSaving(false)
     }
   }
 
@@ -1168,6 +1355,9 @@ function App() {
             rconPassword: '',
             serverUuid: fallbackServer.uuid,
             statusLabel: fallbackServer.status.label,
+            agentId: fallbackServer.uuid,
+            workspaceRoots: [],
+            primaryLogPath: '',
           }
         : null
     const workbenchContent = createServerWorkbenchContent(detailServer)
@@ -1274,17 +1464,17 @@ function App() {
                 <div className="card-header">
                   <div>
                     <div className="card-title">日志连接</div>
-                    <div className="card-subtitle">当前仅为前端伪实时流，后续可直接切换到 WebSocket 或 SSE。</div>
+                    <div className="card-subtitle">当前通过 backend SSE 消费 agent 推送的实时日志。</div>
                   </div>
                 </div>
                 <div className="workbench-log-status-row">
                   <div className="workbench-log-status-card">
                     <span>连接状态</span>
-                    <strong>{sectionContent.connectionLabel}</strong>
+                    <strong>{realtimeLogConnectionLabel}</strong>
                   </div>
                   <div className="workbench-log-status-card">
                     <span>日志频道</span>
-                    <strong>{sectionContent.streamName}</strong>
+                    <strong>{detailServer?.primaryLogPath || sectionContent.streamName}</strong>
                   </div>
                   <div className="workbench-log-status-card">
                     <span>自动滚动</span>
@@ -1513,32 +1703,71 @@ function App() {
                 <div className="card-header">
                   <div>
                     <div className="card-title">配置目录</div>
-                    <div className="card-subtitle">未来可接远程文件树与版本控制。</div>
+                    <div className="card-subtitle">
+                      {detailServer?.workspaceRoots?.[0]?.logicalPath
+                        ? `当前根目录：${detailServer.workspaceRoots[0].logicalPath}`
+                        : '当前服务器尚未上报可浏览的工作目录。'}
+                    </div>
                   </div>
                 </div>
                 <div className="workbench-file-list">
-                  {sectionContent.files.map((file) => (
-                    <button className="workbench-file-item" key={file.path} type="button">
+                  {configFileItems.length > 0 ? configFileItems.map((file) => (
+                    <button
+                      className={`workbench-file-item${selectedConfigFilePath === file.path ? ' active' : ''}`}
+                      key={file.path}
+                      type="button"
+                      onClick={() => {
+                        if (!file.isDir) {
+                          setSelectedConfigFilePath(file.path)
+                        }
+                      }}
+                    >
                       <div>
                         <strong>{file.name}</strong>
                         <span>{file.path}</span>
                       </div>
                       <div className="workbench-file-meta">
-                        <span>{file.status}</span>
-                        <span>{file.size}</span>
+                        <span>{file.isDir ? '目录' : '文件'}</span>
+                        <span>{file.sizeLabel}</span>
                       </div>
                     </button>
-                  ))}
+                  )) : (
+                    <div className="workbench-log-empty">当前目录下暂无可展示文件。</div>
+                  )}
                 </div>
               </div>
               <div className="card">
                 <div className="card-header">
                   <div>
                     <div className="card-title">文件预览</div>
-                    <div className="card-subtitle">当前展示的是静态占位代码块。</div>
+                    <div className="card-subtitle">
+                      {selectedConfigFilePath || '选择左侧文件后可查看并保存内容。'}
+                    </div>
                   </div>
                 </div>
-                <pre className="workbench-code-preview">{sectionContent.preview.join('\n')}</pre>
+                {configFileError ? <div className="form-error workbench-inline-error">{configFileError}</div> : null}
+                <textarea
+                  className="workbench-code-preview workbench-code-editor"
+                  value={configFileDraft}
+                  onChange={(event) => setConfigFileDraft(event.target.value)}
+                  placeholder={configFileLoading ? '正在加载文件内容…' : '当前没有选中文件'}
+                  disabled={configFileLoading || !selectedConfigFilePath}
+                />
+                <div className="workbench-log-command">
+                  <input
+                    type="text"
+                    value={configFileVersion ? `版本：${configFileVersion}${isConfigFileDirty ? ' · 已修改' : ''}` : '未加载版本'}
+                    disabled
+                  />
+                  <button
+                    className="btn btn-primary btn-sm"
+                    type="button"
+                    onClick={handleSaveConfigFile}
+                    disabled={!selectedConfigFilePath || configFileLoading || configFileSaving || !isConfigFileDirty}
+                  >
+                    {configFileSaving ? '保存中…' : '保存文件'}
+                  </button>
+                </div>
               </div>
             </div>
           )

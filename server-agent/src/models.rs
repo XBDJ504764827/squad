@@ -110,6 +110,16 @@ pub struct LogEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLogChunk {
+    pub entries: Vec<LogEnvelope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentFileChanged {
+    pub logical_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedLogEvent {
     pub agent_id: String,
     pub rule_id: String,
@@ -202,6 +212,10 @@ pub enum AgentClientMessage {
     Heartbeat(AgentHeartbeat),
     #[serde(rename = "agent.commandResult")]
     CommandResult(AgentCommandResult),
+    #[serde(rename = "agent.logChunk")]
+    LogChunk(AgentLogChunk),
+    #[serde(rename = "agent.fileChanged")]
+    FileChanged(AgentFileChanged),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

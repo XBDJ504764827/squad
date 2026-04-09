@@ -3,19 +3,23 @@ pub mod agent_ws;
 pub mod models;
 pub mod rcon;
 
-use std::{env, net::SocketAddr, path::Path};
+use std::{convert::Infallible, env, net::SocketAddr, path::Path};
 
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, Query, State, WebSocketUpgrade},
     http::StatusCode,
-    response::IntoResponse,
+    response::{
+        IntoResponse,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
 use dotenvy::from_path_override;
+use futures::stream;
 use models::{
-    ActionResponse, AddServerRequest, AgentCommand, DashboardResponse, ErrorResponse,
-    FilePathQuery, FileReadRequest, FileReadResult, FileTreeRequest, FileTreeResult,
+    ActionResponse, AddServerRequest, AgentCommand, AgentStreamEvent, DashboardResponse,
+    ErrorResponse, FilePathQuery, FileReadRequest, FileReadResult, FileTreeRequest, FileTreeResult,
     FileWriteRequest, FileWriteRequestBody, FileWriteResult, HealthResponse, ManagedServer,
     ManagedServerDetailResponse, UpdateServerRequest,
 };
@@ -78,6 +82,7 @@ pub fn build_app_with_registry(db: PgPool, agent_registry: AgentRegistry) -> Rou
         .route("/api/dashboard", get(dashboard))
         .route("/api/servers", post(add_server))
         .route("/api/agents/connect", get(connect_agent_ws))
+        .route("/api/agents/{agent_id}/events", get(stream_agent_events))
         .route(
             "/api/agents/{agent_id}/files/tree",
             get(get_agent_file_tree),
@@ -104,6 +109,35 @@ async fn connect_agent_ws(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| agent_ws::serve(socket, state.agent_registry))
+}
+
+async fn stream_agent_events(
+    AxumPath(agent_id): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let receiver = state.agent_registry.subscribe_events(&agent_id).await;
+
+    let stream = stream::unfold(receiver, |mut receiver| async move {
+        let next_event = match receiver.recv().await {
+            Ok(event) => event,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                let warning = serde_json::json!({
+                    "message": "agent event stream lagged",
+                    "skipped": skipped,
+                });
+                let event = Event::default()
+                    .event("agent.warning")
+                    .data(warning.to_string());
+                return Some((Ok(event), receiver));
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        };
+
+        let event = Ok(agent_stream_event_to_sse(next_event));
+        Some((event, receiver))
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 async fn get_agent_file_tree(
@@ -205,7 +239,12 @@ async fn get_server(
         .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器详情失败"))?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "服务器不存在"))?;
 
-    Ok(Json(ManagedServerDetailResponse::from_server(&server)))
+    let online_agent = state.agent_registry.get(&server_uuid).await;
+
+    Ok(Json(ManagedServerDetailResponse::from_server(
+        &server,
+        online_agent.as_ref(),
+    )))
 }
 
 async fn add_server(
@@ -383,6 +422,17 @@ fn validate_server_payload(
     }
 
     Ok(())
+}
+
+fn agent_stream_event_to_sse(event: AgentStreamEvent) -> Event {
+    match event {
+        AgentStreamEvent::LogChunk(payload) => Event::default()
+            .event("agent.logChunk")
+            .data(serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())),
+        AgentStreamEvent::FileChanged(payload) => Event::default()
+            .event("agent.fileChanged")
+            .data(serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())),
+    }
 }
 
 async fn initialize_database(db: &PgPool) -> Result<(), sqlx::Error> {

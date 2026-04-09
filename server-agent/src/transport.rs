@@ -10,15 +10,25 @@ use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tracing::warn;
 
 use crate::models::{
-    AgentClientMessage, AgentCommand, AgentCommandResult, AgentError, AgentHeartbeat,
-    AgentRegistered, AgentRegistration, AgentServerMessage,
+    AgentClientMessage, AgentCommand, AgentCommandResult, AgentError, AgentFileChanged,
+    AgentHeartbeat, AgentLogChunk, AgentRegistered, AgentRegistration, AgentServerMessage,
+    LogEnvelope,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 pub trait AgentCommandHandler {
     fn handle_command(&self, command: AgentCommand) -> Result<Option<Value>, AgentError>;
+
+    fn drain_log_entries(&self) -> Result<Vec<LogEnvelope>, AgentError> {
+        Ok(Vec::new())
+    }
+
+    fn drain_file_changes(&self) -> Result<Vec<AgentFileChanged>, AgentError> {
+        Ok(Vec::new())
+    }
 }
 
 pub struct AgentConnection {
@@ -131,13 +141,26 @@ impl Transport {
         H: AgentCommandHandler,
     {
         let mut ticker = interval(HEARTBEAT_INTERVAL);
+        let mut event_ticker = interval(EVENT_POLL_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        event_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         ticker.tick().await;
+        event_ticker.tick().await;
 
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
                     connection.send_heartbeat().await?;
+                }
+                _ = event_ticker.tick() => {
+                    let log_entries = handler.drain_log_entries()?;
+                    if !log_entries.is_empty() {
+                        connection.send_log_chunk(AgentLogChunk { entries: log_entries }).await?;
+                    }
+
+                    for change in handler.drain_file_changes()? {
+                        connection.send_file_changed(change).await?;
+                    }
                 }
                 message = connection.next_server_message() => {
                     match message? {
@@ -187,6 +210,16 @@ impl AgentConnection {
         result: AgentCommandResult,
     ) -> Result<(), AgentError> {
         self.send_message(&AgentClientMessage::CommandResult(result))
+            .await
+    }
+
+    pub async fn send_log_chunk(&mut self, payload: AgentLogChunk) -> Result<(), AgentError> {
+        self.send_message(&AgentClientMessage::LogChunk(payload))
+            .await
+    }
+
+    pub async fn send_file_changed(&mut self, payload: AgentFileChanged) -> Result<(), AgentError> {
+        self.send_message(&AgentClientMessage::FileChanged(payload))
             .await
     }
 

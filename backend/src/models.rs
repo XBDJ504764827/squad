@@ -321,7 +321,7 @@ pub struct ActionResponse {
     pub server_uuid: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedServerDetailResponse {
     pub name: String,
@@ -330,6 +330,9 @@ pub struct ManagedServerDetailResponse {
     pub rcon_password: String,
     pub server_uuid: String,
     pub status_label: String,
+    pub agent_id: String,
+    pub workspace_roots: Vec<WorkspaceRootSummary>,
+    pub primary_log_path: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -634,7 +637,17 @@ impl ServerRow {
 }
 
 impl ManagedServerDetailResponse {
-    pub fn from_server(server: &ManagedServer) -> Self {
+    pub fn from_server(server: &ManagedServer, online_agent: Option<&OnlineAgent>) -> Self {
+        let agent_id = online_agent
+            .map(|agent| agent.registration.agent_id.clone())
+            .unwrap_or_else(|| server.server_uuid.clone());
+        let workspace_roots = online_agent
+            .map(|agent| agent.registration.workspace_roots.clone())
+            .unwrap_or_default();
+        let primary_log_path = online_agent
+            .map(|agent| agent.registration.primary_log_path.clone())
+            .unwrap_or_default();
+
         Self {
             name: server.name.clone(),
             ip: server.ip.clone(),
@@ -642,6 +655,9 @@ impl ManagedServerDetailResponse {
             rcon_password: server.rcon_password.clone(),
             server_uuid: server.server_uuid.clone(),
             status_label: "● 在线".to_string(),
+            agent_id,
+            workspace_roots,
+            primary_log_path,
         }
     }
 }
@@ -679,6 +695,26 @@ pub struct WorkspaceRootSummary {
 pub enum AgentPlatform {
     Linux,
     Windows,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogEnvelope {
+    pub agent_id: String,
+    pub source: String,
+    pub cursor: String,
+    pub line_number: u64,
+    pub raw_line: String,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLogChunk {
+    pub entries: Vec<LogEnvelope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentFileChanged {
+    pub logical_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -789,6 +825,15 @@ pub struct AgentCommandResult {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum AgentStreamEvent {
+    #[serde(rename = "agent.logChunk")]
+    LogChunk(AgentLogChunk),
+    #[serde(rename = "agent.fileChanged")]
+    FileChanged(AgentFileChanged),
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum AgentClientMessage {
@@ -798,6 +843,10 @@ pub enum AgentClientMessage {
     Heartbeat(AgentHeartbeat),
     #[serde(rename = "agent.commandResult")]
     CommandResult(AgentCommandResult),
+    #[serde(rename = "agent.logChunk")]
+    LogChunk(AgentLogChunk),
+    #[serde(rename = "agent.fileChanged")]
+    FileChanged(AgentFileChanged),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

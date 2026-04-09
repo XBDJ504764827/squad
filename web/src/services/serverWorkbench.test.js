@@ -3,9 +3,12 @@ import assert from 'node:assert/strict'
 
 import {
   SERVER_WORKBENCH_SECTIONS,
+  appendAgentLogChunk,
   appendRealtimeLogEntry,
+  buildConfigFileItems,
   createInitialRealtimeLogs,
   filterRealtimeLogEntries,
+  normalizeAgentStreamEvent,
   normalizeWorkbenchSection,
 } from './serverWorkbench.js'
 
@@ -53,4 +56,59 @@ test('filterRealtimeLogEntries filters by level and search term', () => {
   assert.equal(filterRealtimeLogEntries(logs, { level: 'ALL', searchTerm: '' }).length, 2)
   assert.equal(filterRealtimeLogEntries(logs, { level: 'WARN', searchTerm: '' }).length, 1)
   assert.equal(filterRealtimeLogEntries(logs, { level: 'ALL', searchTerm: 'boot' }).length, 1)
+})
+
+test('normalizeAgentStreamEvent parses log chunk and file change payloads', () => {
+  const logEvent = normalizeAgentStreamEvent('agent.logChunk', JSON.stringify({
+    entries: [
+      {
+        agent_id: 'agent-1',
+        source: 'server',
+        cursor: '1',
+        line_number: 1,
+        raw_line: '[WARN] high ping',
+        observed_at: '1710000000000',
+      },
+    ],
+  }))
+  const fileEvent = normalizeAgentStreamEvent('agent.fileChanged', JSON.stringify({
+    logical_path: '/game-root/server.cfg',
+  }))
+
+  assert.equal(logEvent.type, 'logChunk')
+  assert.equal(logEvent.payload.entries[0].raw_line, '[WARN] high ping')
+  assert.equal(fileEvent.type, 'fileChanged')
+  assert.equal(fileEvent.payload.logicalPath, '/game-root/server.cfg')
+})
+
+test('appendAgentLogChunk converts backend log envelopes into workbench log rows', () => {
+  const nextLogs = appendAgentLogChunk([], {
+    entries: [
+      {
+        agent_id: 'agent-1',
+        source: 'server',
+        cursor: '2',
+        line_number: 2,
+        raw_line: '[ERROR] command failed',
+        observed_at: '1710000000000',
+      },
+    ],
+  }, 'Alpha')
+
+  assert.equal(nextLogs.length, 1)
+  assert.equal(nextLogs[0].level, 'ERROR')
+  assert.equal(nextLogs[0].server, 'Alpha')
+  assert.equal(nextLogs[0].message, '[ERROR] command failed')
+})
+
+test('buildConfigFileItems keeps files and folders in a stable workbench shape', () => {
+  const items = buildConfigFileItems([
+    { logicalPath: '/game-root', isDir: true, size: null },
+    { logicalPath: '/game-root/server.cfg', isDir: false, size: 128 },
+  ])
+
+  assert.equal(items.length, 2)
+  assert.equal(items[0].name, 'game-root')
+  assert.equal(items[1].name, 'server.cfg')
+  assert.equal(items[1].sizeLabel, '128 B')
 })

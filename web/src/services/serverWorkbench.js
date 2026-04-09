@@ -69,6 +69,99 @@ export function filterRealtimeLogEntries(entries, { level = 'ALL', searchTerm = 
   })
 }
 
+export function normalizeAgentStreamEvent(eventType, rawData) {
+  const payload = JSON.parse(rawData)
+
+  if (eventType === 'agent.logChunk') {
+    return {
+      type: 'logChunk',
+      payload,
+    }
+  }
+
+  if (eventType === 'agent.fileChanged') {
+    return {
+      type: 'fileChanged',
+      payload: {
+        logicalPath: payload.logicalPath ?? payload.logical_path ?? '',
+      },
+    }
+  }
+
+  return null
+}
+
+function inferRealtimeLogLevel(rawLine) {
+  const normalizedLine = rawLine.toUpperCase()
+
+  if (normalizedLine.includes('ERROR')) {
+    return 'ERROR'
+  }
+  if (normalizedLine.includes('WARN')) {
+    return 'WARN'
+  }
+  if (normalizedLine.includes('CHAT')) {
+    return 'CHAT'
+  }
+  if (normalizedLine.includes('SYSTEM')) {
+    return 'SYSTEM'
+  }
+
+  return 'INFO'
+}
+
+function formatObservedAt(observedAt) {
+  const value = Number(observedAt)
+  if (!Number.isFinite(value)) {
+    return '--:--:--'
+  }
+
+  return new Date(value).toLocaleTimeString('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  })
+}
+
+export function appendAgentLogChunk(entries, chunk, serverName) {
+  const nextEntries = chunk.entries.map((entry, index) => ({
+    id: `${entry.cursor ?? 'cursor'}-${entry.lineNumber ?? entry.line_number ?? index}`,
+    time: formatObservedAt(entry.observedAt ?? entry.observed_at),
+    level: inferRealtimeLogLevel(entry.rawLine ?? entry.raw_line ?? ''),
+    source: entry.source ?? 'server',
+    server: serverName,
+    message: entry.rawLine ?? entry.raw_line ?? '',
+  }))
+
+  return [...entries, ...nextEntries]
+}
+
+function formatFileSize(size) {
+  if (size == null) {
+    return '--'
+  }
+  if (size < 1024) {
+    return `${size} B`
+  }
+
+  return `${Math.round((size / 1024) * 10) / 10} KB`
+}
+
+export function buildConfigFileItems(entries) {
+  return entries.map((entry) => {
+    const logicalPath = entry.logicalPath ?? entry.logical_path ?? ''
+    const segments = logicalPath.split('/').filter(Boolean)
+
+    return {
+      name: segments.at(-1) ?? logicalPath,
+      path: logicalPath,
+      isDir: Boolean(entry.isDir ?? entry.is_dir),
+      sizeLabel: formatFileSize(entry.size ?? null),
+    }
+  })
+}
+
 export function createServerWorkbenchContent(server) {
   const serverName = server?.name ?? '未命名服务器'
   const serverUuid = server?.serverUuid ?? '--'

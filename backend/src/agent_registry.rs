@@ -5,22 +5,24 @@ use std::{
 };
 
 use tokio::{
-    sync::{RwLock, mpsc, oneshot},
+    sync::{RwLock, broadcast, mpsc, oneshot},
     time::{Duration, timeout},
 };
 use uuid::Uuid;
 
 use crate::models::{
     AgentCommand, AgentCommandEnvelope, AgentCommandResult, AgentRegistered, AgentRegistration,
-    AgentServerMessage, OnlineAgent,
+    AgentServerMessage, AgentStreamEvent, OnlineAgent,
 };
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 #[derive(Clone, Default)]
 pub struct AgentRegistry {
     sessions: Arc<RwLock<HashMap<String, AgentSession>>>,
     pending_commands: Arc<RwLock<HashMap<String, PendingCommand>>>,
+    event_channels: Arc<RwLock<HashMap<String, broadcast::Sender<AgentStreamEvent>>>>,
 }
 
 #[derive(Clone)]
@@ -157,6 +159,27 @@ impl AgentRegistry {
         }
     }
 
+    pub async fn subscribe_events(&self, agent_id: &str) -> broadcast::Receiver<AgentStreamEvent> {
+        self.get_or_create_event_sender(agent_id).await.subscribe()
+    }
+
+    pub async fn broadcast_event(&self, agent_id: &str, session_id: &str, event: AgentStreamEvent) {
+        let is_active_session = self
+            .sessions
+            .read()
+            .await
+            .get(agent_id)
+            .map(|session| session.online_agent.session_id == session_id)
+            .unwrap_or(false);
+
+        if !is_active_session {
+            return;
+        }
+
+        let sender = self.get_or_create_event_sender(agent_id).await;
+        let _ = sender.send(event);
+    }
+
     pub async fn remove_session(&self, agent_id: &str, session_id: &str) {
         let mut guard = self.sessions.write().await;
         let should_remove = guard
@@ -191,6 +214,24 @@ impl AgentRegistry {
         for request_id in request_ids {
             guard.remove(&request_id);
         }
+    }
+
+    async fn get_or_create_event_sender(
+        &self,
+        agent_id: &str,
+    ) -> broadcast::Sender<AgentStreamEvent> {
+        if let Some(sender) = self.event_channels.read().await.get(agent_id).cloned() {
+            return sender;
+        }
+
+        let mut guard = self.event_channels.write().await;
+        guard
+            .entry(agent_id.to_string())
+            .or_insert_with(|| {
+                let (sender, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+                sender
+            })
+            .clone()
     }
 }
 

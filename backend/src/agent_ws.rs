@@ -75,6 +75,24 @@ pub async fn serve(mut socket: WebSocket, registry: AgentRegistry) {
                                     .resolve_command_result(&agent_id, &session_id, payload)
                                     .await;
                             }
+                            AgentClientMessage::LogChunk(payload) => {
+                                registry
+                                    .broadcast_event(
+                                        &agent_id,
+                                        &session_id,
+                                        crate::models::AgentStreamEvent::LogChunk(payload),
+                                    )
+                                    .await;
+                            }
+                            AgentClientMessage::FileChanged(payload) => {
+                                registry
+                                    .broadcast_event(
+                                        &agent_id,
+                                        &session_id,
+                                        crate::models::AgentStreamEvent::FileChanged(payload),
+                                    )
+                                    .await;
+                            }
                             AgentClientMessage::Register(_) => break,
                         }
                     }
@@ -106,7 +124,10 @@ async fn read_registration(
         .map_err(|err| format!("invalid registration payload: {err}"))?;
     let registration = match message {
         AgentClientMessage::Register(payload) => payload,
-        AgentClientMessage::Heartbeat(_) | AgentClientMessage::CommandResult(_) => {
+        AgentClientMessage::Heartbeat(_)
+        | AgentClientMessage::CommandResult(_)
+        | AgentClientMessage::LogChunk(_)
+        | AgentClientMessage::FileChanged(_) => {
             return Err("first frame must be agent.register".to_string());
         }
     };

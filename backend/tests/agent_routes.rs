@@ -3,8 +3,9 @@ use backend::{
     agent_registry::AgentRegistry,
     build_app_with_registry,
     models::{
-        AgentClientMessage, AgentCommand, AgentCommandResult, AgentHeartbeat, AgentPlatform,
-        AgentRegistration, AgentServerMessage, WorkspaceRootSummary,
+        AgentClientMessage, AgentCommand, AgentCommandResult, AgentFileChanged, AgentHeartbeat,
+        AgentLogChunk, AgentPlatform, AgentRegistration, AgentServerMessage, AgentStreamEvent,
+        LogEnvelope, WorkspaceRootSummary,
     },
 };
 use futures::{SinkExt, StreamExt};
@@ -254,6 +255,140 @@ async fn dispatch_command_bridges_response_between_backend_and_agent() {
     let result = dispatch.await.expect("dispatch task should finish");
     assert_eq!(result.request_id, request_id);
     assert_eq!(result.payload, Some(json!({ "pong": true })));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn log_chunk_is_broadcast_to_agent_event_subscribers() {
+    let registry = AgentRegistry::default();
+    let app = build_app_with_registry(make_lazy_db(), registry.clone());
+    let (url, server) = spawn_app(app).await;
+    let (mut socket, _) = connect_async(&url)
+        .await
+        .expect("websocket upgrade should succeed");
+
+    let registration = AgentClientMessage::Register(AgentRegistration {
+        agent_id: "agent-1".to_string(),
+        token: "test-token".to_string(),
+        platform: AgentPlatform::Linux,
+        version: "0.1.0".to_string(),
+        workspace_roots: vec![WorkspaceRootSummary {
+            name: "game-root".to_string(),
+            logical_path: "/game-root".to_string(),
+        }],
+        primary_log_path: "/srv/game/server.log".to_string(),
+    });
+
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&registration)
+                .expect("registration json")
+                .into(),
+        ))
+        .await
+        .expect("registration should send");
+    let _ = socket
+        .next()
+        .await
+        .expect("ack frame")
+        .expect("ack readable");
+
+    let mut receiver = registry.subscribe_events("agent-1").await;
+
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&AgentClientMessage::LogChunk(AgentLogChunk {
+                entries: vec![LogEnvelope {
+                    agent_id: "agent-1".to_string(),
+                    source: "server".to_string(),
+                    cursor: "1".to_string(),
+                    line_number: 1,
+                    raw_line: "server started".to_string(),
+                    observed_at: "1".to_string(),
+                }],
+            }))
+            .expect("log chunk json")
+            .into(),
+        ))
+        .await
+        .expect("log chunk should send");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+        .await
+        .expect("event should arrive")
+        .expect("receiver should stay open");
+
+    match event {
+        AgentStreamEvent::LogChunk(payload) => {
+            assert_eq!(payload.entries.len(), 1);
+            assert_eq!(payload.entries[0].raw_line, "server started");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn file_change_is_broadcast_to_agent_event_subscribers() {
+    let registry = AgentRegistry::default();
+    let app = build_app_with_registry(make_lazy_db(), registry.clone());
+    let (url, server) = spawn_app(app).await;
+    let (mut socket, _) = connect_async(&url)
+        .await
+        .expect("websocket upgrade should succeed");
+
+    let registration = AgentClientMessage::Register(AgentRegistration {
+        agent_id: "agent-1".to_string(),
+        token: "test-token".to_string(),
+        platform: AgentPlatform::Linux,
+        version: "0.1.0".to_string(),
+        workspace_roots: vec![WorkspaceRootSummary {
+            name: "game-root".to_string(),
+            logical_path: "/game-root".to_string(),
+        }],
+        primary_log_path: "/srv/game/server.log".to_string(),
+    });
+
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&registration)
+                .expect("registration json")
+                .into(),
+        ))
+        .await
+        .expect("registration should send");
+    let _ = socket
+        .next()
+        .await
+        .expect("ack frame")
+        .expect("ack readable");
+
+    let mut receiver = registry.subscribe_events("agent-1").await;
+
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&AgentClientMessage::FileChanged(AgentFileChanged {
+                logical_path: "/game-root/server.cfg".to_string(),
+            }))
+            .expect("file changed json")
+            .into(),
+        ))
+        .await
+        .expect("file changed should send");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+        .await
+        .expect("event should arrive")
+        .expect("receiver should stay open");
+
+    match event {
+        AgentStreamEvent::FileChanged(payload) => {
+            assert_eq!(payload.logical_path, "/game-root/server.cfg");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
 
     server.abort();
 }

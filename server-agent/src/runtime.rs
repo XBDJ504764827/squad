@@ -1,17 +1,22 @@
 use anyhow::Result;
 use serde_json::Value;
+use std::sync::Mutex;
 use tracing::info;
 
+use crate::file_watcher::FileWatcher;
 use crate::{
-    AgentCommand, AgentCommandHandler, AgentConfig, AgentError, AgentRegistration, FileReadResult,
-    FileService, FileTreeResult, FileWriteResult, LogParser, PathPolicy, Transport,
-    WorkspaceRootSummary,
+    AgentCommand, AgentCommandHandler, AgentConfig, AgentError, AgentFileChanged,
+    AgentRegistration, FileReadResult, FileService, FileTreeResult, FileWriteResult, LogEnvelope,
+    LogParser, LogTailer, PathPolicy, Transport, WorkspaceRootSummary,
 };
 
 pub async fn run(config: AgentConfig) -> Result<()> {
-    let path_policy = PathPolicy::new(&config.workspace_roots())?;
-    let file_service = FileService::new(path_policy, config.file_service_config());
+    let workspace_roots = config.workspace_roots();
+    let path_policy = PathPolicy::new(&workspace_roots)?;
+    let file_service = FileService::new(path_policy.clone(), config.file_service_config());
     let _parser = LogParser::new(config.parse_rules.clone())?;
+    let log_tailer = LogTailer::new(config.agent_id.clone(), "server", config.log_source.clone())?;
+    let file_watcher = FileWatcher::new(path_policy, &workspace_roots)?;
 
     info!(
         agent_id = %config.agent_id,
@@ -39,7 +44,7 @@ pub async fn run(config: AgentConfig) -> Result<()> {
             .collect(),
         primary_log_path: config.log_source.primary_path.to_string_lossy().to_string(),
     };
-    let handler = RuntimeCommandHandler::new(file_service);
+    let handler = RuntimeCommandHandler::with_streaming(file_service, log_tailer, file_watcher);
     transport.run(registration, &handler).await?;
 
     Ok(())
@@ -47,11 +52,29 @@ pub async fn run(config: AgentConfig) -> Result<()> {
 
 pub struct RuntimeCommandHandler {
     file_service: FileService,
+    log_tailer: Option<Mutex<LogTailer>>,
+    file_watcher: Option<Mutex<FileWatcher>>,
 }
 
 impl RuntimeCommandHandler {
     pub fn new(file_service: FileService) -> Self {
-        Self { file_service }
+        Self {
+            file_service,
+            log_tailer: None,
+            file_watcher: None,
+        }
+    }
+
+    pub fn with_streaming(
+        file_service: FileService,
+        log_tailer: LogTailer,
+        file_watcher: FileWatcher,
+    ) -> Self {
+        Self {
+            file_service,
+            log_tailer: Some(Mutex::new(log_tailer)),
+            file_watcher: Some(Mutex::new(file_watcher)),
+        }
     }
 }
 
@@ -95,5 +118,27 @@ impl AgentCommandHandler for RuntimeCommandHandler {
                 })
             }
         }
+    }
+
+    fn drain_log_entries(&self) -> Result<Vec<LogEnvelope>, AgentError> {
+        let Some(log_tailer) = &self.log_tailer else {
+            return Ok(Vec::new());
+        };
+
+        log_tailer
+            .lock()
+            .map_err(|_| AgentError::Runtime("failed to lock log tailer".to_string()))?
+            .poll()
+    }
+
+    fn drain_file_changes(&self) -> Result<Vec<AgentFileChanged>, AgentError> {
+        let Some(file_watcher) = &self.file_watcher else {
+            return Ok(Vec::new());
+        };
+
+        file_watcher
+            .lock()
+            .map_err(|_| AgentError::Runtime("failed to lock file watcher".to_string()))?
+            .poll_changes()
     }
 }
