@@ -1,3 +1,5 @@
+pub mod agent_registry;
+pub mod agent_ws;
 pub mod models;
 pub mod rcon;
 
@@ -5,8 +7,9 @@ use std::{env, net::SocketAddr, path::Path};
 
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, State, WebSocketUpgrade},
     http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
 };
 use dotenvy::from_path_override;
@@ -18,9 +21,12 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
+use crate::agent_registry::AgentRegistry;
+
 #[derive(Clone)]
 struct AppState {
     db: PgPool,
+    agent_registry: AgentRegistry,
 }
 
 struct AppConfig {
@@ -60,21 +66,33 @@ pub async fn run() {
 }
 
 pub fn build_app(db: PgPool) -> Router {
+    build_app_with_registry(db, AgentRegistry::default())
+}
+
+pub fn build_app_with_registry(db: PgPool, agent_registry: AgentRegistry) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/dashboard", get(dashboard))
         .route("/api/servers", post(add_server))
+        .route("/api/agents/connect", get(connect_agent_ws))
         .route(
             "/api/servers/{server_uuid}",
             get(get_server).put(update_server).delete(delete_server),
         )
-        .with_state(AppState { db })
+        .with_state(AppState { db, agent_registry })
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
+}
+
+async fn connect_agent_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| agent_ws::serve(socket, state.agent_registry))
 }
 
 impl AppConfig {
@@ -206,9 +224,16 @@ async fn update_server(
         .await
         .map_err(|message| error_response(StatusCode::BAD_REQUEST, &message))?;
 
-    let updated = update_server_record(&state.db, &server_uuid, &name, &ip, payload.rcon_port, &password)
-        .await
-        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "服务器更新失败"))?;
+    let updated = update_server_record(
+        &state.db,
+        &server_uuid,
+        &name,
+        &ip,
+        payload.rcon_port,
+        &password,
+    )
+    .await
+    .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "服务器更新失败"))?;
 
     if !updated {
         return Err(error_response(StatusCode::NOT_FOUND, "服务器不存在"));

@@ -24,6 +24,13 @@ pub struct WriteFileResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceRootSummary {
+    pub name: String,
+    pub logical_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentPlatform {
     Linux,
@@ -107,6 +114,38 @@ pub struct ParsedLogEvent {
     pub payload: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRegistration {
+    pub agent_id: String,
+    pub token: String,
+    pub platform: AgentPlatform,
+    pub version: String,
+    pub workspace_roots: Vec<WorkspaceRootSummary>,
+    pub primary_log_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRegistered {
+    pub agent_id: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum AgentClientMessage {
+    #[serde(rename = "agent.register")]
+    Register(AgentRegistration),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum AgentServerMessage {
+    #[serde(rename = "agent.registered")]
+    Registered(AgentRegistered),
+}
+
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("invalid config: {0}")]
@@ -128,10 +167,7 @@ pub enum AgentError {
         actual_size: u64,
     },
     #[error("extension not allowed: path={path}, extension={extension}")]
-    ExtensionNotAllowed {
-        path: String,
-        extension: String,
-    },
+    ExtensionNotAllowed { path: String, extension: String },
     #[error("file is not utf-8: {0}")]
     NotUtf8(String),
     #[error("version conflict: path={path}, expected={expected}, actual={actual}")]

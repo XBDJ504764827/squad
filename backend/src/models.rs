@@ -665,3 +665,57 @@ fn empty_stat(
         sparkline_data: vec![],
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceRootSummary {
+    pub name: String,
+    pub logical_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentPlatform {
+    Linux,
+    Windows,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRegistration {
+    pub agent_id: String,
+    pub token: String,
+    pub platform: AgentPlatform,
+    pub version: String,
+    pub workspace_roots: Vec<WorkspaceRootSummary>,
+    pub primary_log_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRegistered {
+    pub agent_id: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum AgentClientMessage {
+    #[serde(rename = "agent.register")]
+    Register(AgentRegistration),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum AgentServerMessage {
+    #[serde(rename = "agent.registered")]
+    Registered(AgentRegistered),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnlineAgent {
+    pub session_id: String,
+    pub connected_at_ms: u64,
+    pub registration: AgentRegistration,
+}
