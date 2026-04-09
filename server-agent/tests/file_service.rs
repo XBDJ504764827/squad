@@ -2,9 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use server_agent::{
-    AgentError, FileService, FileServiceConfig, PathPolicy, WorkspaceRootConfig,
-};
+use server_agent::{AgentError, FileService, FileServiceConfig, PathPolicy, WorkspaceRootConfig};
 
 fn make_temp_dir(prefix: &str) -> PathBuf {
     let nanos = SystemTime::now()

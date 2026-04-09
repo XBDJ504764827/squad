@@ -35,7 +35,9 @@ impl FileService {
     }
 
     pub fn list_tree(&self, logical_dir: &str) -> Result<Vec<FileTreeEntry>, AgentError> {
-        let root_dir = self.path_policy.resolve_existing_logical_path(logical_dir)?;
+        let root_dir = self
+            .path_policy
+            .resolve_existing_logical_path(logical_dir)?;
         if !root_dir.is_dir() {
             return Err(AgentError::AccessDenied(logical_dir.to_string()));
         }
@@ -45,7 +47,9 @@ impl FileService {
         while let Some(current_dir) = stack.pop() {
             for entry in fs::read_dir(current_dir)? {
                 let entry = entry?;
-                let real_path = self.path_policy.resolve_existing_local_path(&entry.path())?;
+                let real_path = self
+                    .path_policy
+                    .resolve_existing_local_path(&entry.path())?;
                 let metadata = fs::metadata(&real_path)?;
                 let logical_path = self.path_policy.local_to_logical(&real_path)?;
                 let is_dir = metadata.is_dir();
@@ -137,7 +141,11 @@ impl FileService {
         ext
     }
 
-    fn ensure_extension_allowed(&self, logical_path: &str, local_path: &Path) -> Result<(), AgentError> {
+    fn ensure_extension_allowed(
+        &self,
+        logical_path: &str,
+        local_path: &Path,
+    ) -> Result<(), AgentError> {
         let Some(allowed_extensions) = &self.allowed_extensions else {
             return Ok(());
         };

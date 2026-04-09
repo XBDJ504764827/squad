@@ -1,8 +1,6 @@
 use regex::Regex;
 
-use crate::models::{
-    AgentError, LogEnvelope, ParseRule, ParseRuleKind, ParsedLogEvent,
-};
+use crate::models::{AgentError, LogEnvelope, ParseRule, ParseRuleKind, ParsedLogEvent};
 
 #[derive(Debug)]
 struct CompiledRule {
@@ -56,15 +54,16 @@ impl LogParser {
     }
 
     fn compile_rules(rules: Vec<ParseRule>) -> Result<Vec<CompiledRule>, AgentError> {
-        rules.into_iter()
+        rules
+            .into_iter()
             .map(|rule| {
                 let regex = match rule.kind {
-                    ParseRuleKind::Regex => Regex::new(&rule.pattern).map_err(|err| {
-                        AgentError::InvalidParseRule {
+                    ParseRuleKind::Regex => {
+                        Regex::new(&rule.pattern).map_err(|err| AgentError::InvalidParseRule {
                             rule_id: rule.id.clone(),
                             message: err.to_string(),
-                        }
-                    })?,
+                        })?
+                    }
                 };
 
                 Ok(CompiledRule { rule, regex })

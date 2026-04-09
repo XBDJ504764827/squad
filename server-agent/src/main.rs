@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use server_agent::{AgentConfig, runtime};
+use server_agent::{runtime, AgentConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {

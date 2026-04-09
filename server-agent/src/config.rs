@@ -83,7 +83,9 @@ impl AgentConfig {
         self.default_encoding = self.default_encoding.trim().to_string();
 
         if self.agent_id.is_empty() {
-            return Err(AgentError::InvalidConfig("agent_id is required".to_string()));
+            return Err(AgentError::InvalidConfig(
+                "agent_id is required".to_string(),
+            ));
         }
         if self.backend_ws_url.is_empty() {
             return Err(AgentError::InvalidConfig(

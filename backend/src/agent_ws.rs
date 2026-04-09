@@ -1,5 +1,6 @@
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
 
 use crate::{
     agent_registry::AgentRegistry,
@@ -16,7 +17,8 @@ pub async fn serve(mut socket: WebSocket, registry: AgentRegistry) {
         }
     };
 
-    let registered = registry.register(registration.clone()).await;
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
+    let registered = registry.register(registration.clone(), outbound_tx).await;
     let session_id = registered.session_id.clone();
     let agent_id = registered.agent_id.clone();
     let ack = match serde_json::to_string(&AgentServerMessage::Registered(registered)) {
@@ -33,16 +35,53 @@ pub async fn serve(mut socket: WebSocket, registry: AgentRegistry) {
         return;
     }
 
-    while let Some(message) = socket.next().await {
-        match message {
-            Ok(Message::Close(_)) => break,
-            Ok(Message::Ping(payload)) => {
-                if socket.send(Message::Pong(payload)).await.is_err() {
-                    break;
+    loop {
+        tokio::select! {
+            outbound = outbound_rx.recv() => {
+                match outbound {
+                    Some(payload) => {
+                        if socket.send(Message::Text(payload.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
                 }
             }
-            Ok(_) => {}
-            Err(_) => break,
+            inbound = socket.next() => {
+                let Some(message) = inbound else {
+                    break;
+                };
+
+                match message {
+                    Ok(Message::Close(_)) => break,
+                    Ok(Message::Ping(payload)) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Message::Pong(_)) => {}
+                    Ok(Message::Text(text)) => {
+                        let message = match serde_json::from_str::<AgentClientMessage>(text.as_ref()) {
+                            Ok(message) => message,
+                            Err(_) => break,
+                        };
+
+                        match message {
+                            AgentClientMessage::Heartbeat(_) => {
+                                registry.record_heartbeat(&agent_id, &session_id).await;
+                            }
+                            AgentClientMessage::CommandResult(payload) => {
+                                registry
+                                    .resolve_command_result(&agent_id, &session_id, payload)
+                                    .await;
+                            }
+                            AgentClientMessage::Register(_) => break,
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
         }
     }
 
@@ -67,6 +106,9 @@ async fn read_registration(
         .map_err(|err| format!("invalid registration payload: {err}"))?;
     let registration = match message {
         AgentClientMessage::Register(payload) => payload,
+        AgentClientMessage::Heartbeat(_) | AgentClientMessage::CommandResult(_) => {
+            return Err("first frame must be agent.register".to_string());
+        }
     };
 
     if registration.agent_id.trim().is_empty() {

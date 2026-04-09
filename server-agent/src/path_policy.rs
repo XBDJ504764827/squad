@@ -14,8 +14,9 @@ impl PathPolicy {
     pub fn new(roots: &[WorkspaceRootConfig]) -> Result<Self, AgentError> {
         let mut map = HashMap::new();
         for root in roots {
-            Self::validate_segment(&root.name)
-                .map_err(|_| AgentError::InvalidConfig(format!("workspace root name is invalid: {}", root.name)))?;
+            Self::validate_segment(&root.name).map_err(|_| {
+                AgentError::InvalidConfig(format!("workspace root name is invalid: {}", root.name))
+            })?;
             if map.contains_key(&root.name) {
                 return Err(AgentError::InvalidConfig(format!(
                     "duplicate workspace root: {}",
@@ -149,7 +150,10 @@ impl PathPolicy {
         None
     }
 
-    fn local_to_logical_from_candidate(&self, candidate: &Path) -> Result<Option<String>, AgentError> {
+    fn local_to_logical_from_candidate(
+        &self,
+        candidate: &Path,
+    ) -> Result<Option<String>, AgentError> {
         for (root_name, root_path) in self.roots_longest_first() {
             if let Ok(relative) = candidate.strip_prefix(root_path) {
                 let mut logical_parts = Vec::new();
@@ -160,7 +164,9 @@ impl PathPolicy {
                                 AgentError::PathEncoding(candidate.display().to_string())
                             })?;
                             if Self::validate_segment(value).is_err() {
-                                return Err(AgentError::AccessDenied(candidate.display().to_string()));
+                                return Err(AgentError::AccessDenied(
+                                    candidate.display().to_string(),
+                                ));
                             }
                             logical_parts.push(value.to_string());
                         }

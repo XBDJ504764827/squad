@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::FromRow;
 
 #[derive(Clone, Serialize)]
@@ -698,11 +699,42 @@ pub struct AgentRegistered {
     pub session_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentHeartbeat {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCommand {
+    Ping,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCommandEnvelope {
+    pub request_id: String,
+    pub command: AgentCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentCommandResult {
+    pub request_id: String,
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum AgentClientMessage {
     #[serde(rename = "agent.register")]
     Register(AgentRegistration),
+    #[serde(rename = "agent.heartbeat")]
+    Heartbeat(AgentHeartbeat),
+    #[serde(rename = "agent.commandResult")]
+    CommandResult(AgentCommandResult),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -710,6 +742,8 @@ pub enum AgentClientMessage {
 pub enum AgentServerMessage {
     #[serde(rename = "agent.registered")]
     Registered(AgentRegistered),
+    #[serde(rename = "agent.command")]
+    Command(AgentCommandEnvelope),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -717,5 +751,6 @@ pub enum AgentServerMessage {
 pub struct OnlineAgent {
     pub session_id: String,
     pub connected_at_ms: u64,
+    pub last_heartbeat_at_ms: u64,
     pub registration: AgentRegistration,
 }

@@ -13,9 +13,10 @@ pub use file_service::FileService;
 pub use log_parser::LogParser;
 pub use log_tail::LogTailer;
 pub use models::{
-    AgentClientMessage, AgentError, AgentPlatform, AgentRegistered, AgentRegistration,
-    AgentServerMessage, FileTreeEntry, LogEnvelope, LogSourceConfig, LogStartPosition, ParseRule,
-    ParseRuleKind, ParsedLogEvent, ReadFileResult, WorkspaceRootSummary, WriteFileResult,
+    AgentClientMessage, AgentCommand, AgentCommandEnvelope, AgentCommandResult, AgentError,
+    AgentHeartbeat, AgentPlatform, AgentRegistered, AgentRegistration, AgentServerMessage,
+    FileTreeEntry, LogEnvelope, LogSourceConfig, LogStartPosition, ParseRule, ParseRuleKind,
+    ParsedLogEvent, ReadFileResult, WorkspaceRootSummary, WriteFileResult,
 };
 pub use path_policy::PathPolicy;
-pub use transport::Transport;
+pub use transport::{AgentCommandHandler, AgentConnection, Transport};

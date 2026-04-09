@@ -58,7 +58,9 @@ fn returns_none_when_no_rule_matches() {
     )])
     .expect("create parser");
 
-    assert!(parser.parse(&make_envelope("server boot complete")).is_none());
+    assert!(parser
+        .parse(&make_envelope("server boot complete"))
+        .is_none());
 }
 
 #[test]
@@ -89,6 +91,12 @@ fn replacing_rules_takes_effect_immediately() {
     assert_eq!(event.rule_id, "kill-line");
     assert_eq!(event.event_type, "kill");
     assert_eq!(event.severity, "warn");
-    assert_eq!(event.payload.get("attacker").map(String::as_str), Some("Fox"));
-    assert_eq!(event.payload.get("victim").map(String::as_str), Some("Mint"));
+    assert_eq!(
+        event.payload.get("attacker").map(String::as_str),
+        Some("Fox")
+    );
+    assert_eq!(
+        event.payload.get("victim").map(String::as_str),
+        Some("Mint")
+    );
 }

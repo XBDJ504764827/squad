@@ -175,8 +175,8 @@ impl LogTailer {
     fn file_identity_from_metadata(metadata: &fs::Metadata) -> FileIdentity {
         use std::os::windows::fs::MetadataExt;
 
-        let file_index = ((metadata.file_index_high() as u64) << 32)
-            | metadata.file_index_low() as u64;
+        let file_index =
+            ((metadata.file_index_high() as u64) << 32) | metadata.file_index_low() as u64;
 
         FileIdentity {
             volume_serial_number: metadata.volume_serial_number().unwrap_or_default() as u64,
