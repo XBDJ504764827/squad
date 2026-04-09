@@ -82,6 +82,15 @@ impl AgentRegistry {
             .map(|session| session.online_agent.clone())
     }
 
+    pub async fn list(&self) -> Vec<OnlineAgent> {
+        self.sessions
+            .read()
+            .await
+            .values()
+            .map(|session| session.online_agent.clone())
+            .collect()
+    }
+
     pub async fn record_heartbeat(&self, agent_id: &str, session_id: &str) {
         let mut guard = self.sessions.write().await;
         if let Some(session) = guard.get_mut(agent_id) {

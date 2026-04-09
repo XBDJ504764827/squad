@@ -330,9 +330,41 @@ pub struct ManagedServerDetailResponse {
     pub rcon_password: String,
     pub server_uuid: String,
     pub status_label: String,
-    pub agent_id: String,
+    pub agent_id: Option<String>,
+    pub agent_online: bool,
     pub workspace_roots: Vec<WorkspaceRootSummary>,
     pub primary_log_path: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerAgentBindingResponse {
+    pub server_uuid: String,
+    pub agent_id: Option<String>,
+    pub agent_online: bool,
+    pub workspace_roots: Vec<WorkspaceRootSummary>,
+    pub primary_log_path: String,
+    pub last_heartbeat_at: Option<u64>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateServerAgentBindingRequest {
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnlineAgentSummary {
+    pub agent_id: String,
+    pub platform: AgentPlatform,
+    pub version: String,
+    pub workspace_roots: Vec<WorkspaceRootSummary>,
+    pub primary_log_path: String,
+    pub connected_at: u64,
+    pub last_heartbeat_at: u64,
+    pub is_bound: bool,
+    pub bound_server_uuid: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -637,17 +669,11 @@ impl ServerRow {
 }
 
 impl ManagedServerDetailResponse {
-    pub fn from_server(server: &ManagedServer, online_agent: Option<&OnlineAgent>) -> Self {
-        let agent_id = online_agent
-            .map(|agent| agent.registration.agent_id.clone())
-            .unwrap_or_else(|| server.server_uuid.clone());
-        let workspace_roots = online_agent
-            .map(|agent| agent.registration.workspace_roots.clone())
-            .unwrap_or_default();
-        let primary_log_path = online_agent
-            .map(|agent| agent.registration.primary_log_path.clone())
-            .unwrap_or_default();
-
+    pub fn from_server(
+        server: &ManagedServer,
+        binding_agent_id: Option<&str>,
+        online_agent: Option<&OnlineAgent>,
+    ) -> Self {
         Self {
             name: server.name.clone(),
             ip: server.ip.clone(),
@@ -655,9 +681,35 @@ impl ManagedServerDetailResponse {
             rcon_password: server.rcon_password.clone(),
             server_uuid: server.server_uuid.clone(),
             status_label: "● 在线".to_string(),
-            agent_id,
-            workspace_roots,
-            primary_log_path,
+            agent_id: binding_agent_id.map(ToOwned::to_owned),
+            agent_online: online_agent.is_some(),
+            workspace_roots: online_agent
+                .map(|agent| agent.registration.workspace_roots.clone())
+                .unwrap_or_default(),
+            primary_log_path: online_agent
+                .map(|agent| agent.registration.primary_log_path.clone())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl ServerAgentBindingResponse {
+    pub fn from_binding(
+        server_uuid: &str,
+        binding_agent_id: Option<&str>,
+        online_agent: Option<&OnlineAgent>,
+    ) -> Self {
+        Self {
+            server_uuid: server_uuid.to_string(),
+            agent_id: binding_agent_id.map(ToOwned::to_owned),
+            agent_online: online_agent.is_some(),
+            workspace_roots: online_agent
+                .map(|agent| agent.registration.workspace_roots.clone())
+                .unwrap_or_default(),
+            primary_log_path: online_agent
+                .map(|agent| agent.registration.primary_log_path.clone())
+                .unwrap_or_default(),
+            last_heartbeat_at: online_agent.map(|agent| agent.last_heartbeat_at_ms),
         }
     }
 }

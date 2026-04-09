@@ -3,7 +3,7 @@ pub mod agent_ws;
 pub mod models;
 pub mod rcon;
 
-use std::{convert::Infallible, env, net::SocketAddr, path::Path};
+use std::{collections::HashMap, convert::Infallible, env, net::SocketAddr, path::Path};
 
 use axum::{
     Json, Router,
@@ -21,10 +21,11 @@ use models::{
     ActionResponse, AddServerRequest, AgentCommand, AgentStreamEvent, DashboardResponse,
     ErrorResponse, FilePathQuery, FileReadRequest, FileReadResult, FileTreeRequest, FileTreeResult,
     FileWriteRequest, FileWriteRequestBody, FileWriteResult, HealthResponse, ManagedServer,
-    ManagedServerDetailResponse, UpdateServerRequest,
+    ManagedServerDetailResponse, OnlineAgentSummary, ServerAgentBindingResponse,
+    UpdateServerAgentBindingRequest, UpdateServerRequest,
 };
 use serde::de::DeserializeOwned;
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
@@ -81,6 +82,7 @@ pub fn build_app_with_registry(db: PgPool, agent_registry: AgentRegistry) -> Rou
         .route("/api/health", get(health))
         .route("/api/dashboard", get(dashboard))
         .route("/api/servers", post(add_server))
+        .route("/api/agents/online", get(list_online_agents))
         .route("/api/agents/connect", get(connect_agent_ws))
         .route("/api/agents/{agent_id}/events", get(stream_agent_events))
         .route(
@@ -94,6 +96,12 @@ pub fn build_app_with_registry(db: PgPool, agent_registry: AgentRegistry) -> Rou
         .route(
             "/api/servers/{server_uuid}",
             get(get_server).put(update_server).delete(delete_server),
+        )
+        .route(
+            "/api/servers/{server_uuid}/agent-binding",
+            get(get_server_agent_binding)
+                .put(put_server_agent_binding)
+                .delete(delete_server_agent_binding),
         )
         .with_state(AppState { db, agent_registry })
         .layer(
@@ -230,6 +238,42 @@ async fn dashboard(
     Ok(Json(DashboardResponse::from_servers(&servers)))
 }
 
+async fn list_online_agents(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<OnlineAgentSummary>>, (StatusCode, Json<ErrorResponse>)> {
+    let binding_by_agent = fetch_all_server_agent_bindings(&state.db)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取 agent 绑定关系失败"))?
+        .into_iter()
+        .map(|binding| (binding.agent_id, binding.server_uuid))
+        .collect::<HashMap<_, _>>();
+
+    let mut items = state
+        .agent_registry
+        .list()
+        .await
+        .into_iter()
+        .map(|agent| {
+            let bound_server_uuid = binding_by_agent.get(&agent.registration.agent_id).cloned();
+            OnlineAgentSummary {
+                agent_id: agent.registration.agent_id.clone(),
+                platform: agent.registration.platform.clone(),
+                version: agent.registration.version.clone(),
+                workspace_roots: agent.registration.workspace_roots.clone(),
+                primary_log_path: agent.registration.primary_log_path.clone(),
+                connected_at: agent.connected_at_ms,
+                last_heartbeat_at: agent.last_heartbeat_at_ms,
+                is_bound: bound_server_uuid.is_some(),
+                bound_server_uuid,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    items.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+
+    Ok(Json(items))
+}
+
 async fn get_server(
     AxumPath(server_uuid): AxumPath<String>,
     State(state): State<AppState>,
@@ -239,10 +283,35 @@ async fn get_server(
         .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器详情失败"))?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "服务器不存在"))?;
 
-    let online_agent = state.agent_registry.get(&server_uuid).await;
-
     Ok(Json(ManagedServerDetailResponse::from_server(
         &server,
+        None,
+        None,
+    )))
+}
+
+async fn get_server_agent_binding(
+    AxumPath(server_uuid): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<ServerAgentBindingResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !server_exists(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器失败"))?
+    {
+        return Err(error_response(StatusCode::NOT_FOUND, "服务器不存在"));
+    }
+
+    let binding = fetch_server_agent_binding_by_server_uuid(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取绑定关系失败"))?;
+    let online_agent = match binding.as_ref() {
+        Some(binding) => state.agent_registry.get(&binding.agent_id).await,
+        None => None,
+    };
+
+    Ok(Json(ServerAgentBindingResponse::from_binding(
+        &server_uuid,
+        binding.as_ref().map(|binding| binding.agent_id.as_str()),
         online_agent.as_ref(),
     )))
 }
@@ -364,6 +433,70 @@ async fn delete_server(
         message: "服务器删除成功".to_string(),
         server_uuid,
     }))
+}
+
+async fn put_server_agent_binding(
+    AxumPath(server_uuid): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<UpdateServerAgentBindingRequest>,
+) -> Result<Json<ServerAgentBindingResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !server_exists(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器失败"))?
+    {
+        return Err(error_response(StatusCode::NOT_FOUND, "服务器不存在"));
+    }
+
+    let agent_id = payload.agent_id.trim().to_string();
+    if agent_id.is_empty() {
+        return Err(error_response(StatusCode::BAD_REQUEST, "agentId 不能为空"));
+    }
+
+    let existing_binding = fetch_server_agent_binding_by_agent_id(&state.db, &agent_id)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取绑定关系失败"))?;
+    if let Some(existing_binding) = existing_binding {
+        if existing_binding.server_uuid != server_uuid {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "agent 已绑定到其他服务器",
+            ));
+        }
+    }
+
+    upsert_server_agent_binding(&state.db, &server_uuid, &agent_id)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "写入绑定关系失败"))?;
+
+    let online_agent = state.agent_registry.get(&agent_id).await;
+
+    Ok(Json(ServerAgentBindingResponse::from_binding(
+        &server_uuid,
+        Some(&agent_id),
+        online_agent.as_ref(),
+    )))
+}
+
+async fn delete_server_agent_binding(
+    AxumPath(server_uuid): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<ServerAgentBindingResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !server_exists(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器失败"))?
+    {
+        return Err(error_response(StatusCode::NOT_FOUND, "服务器不存在"));
+    }
+
+    delete_server_agent_binding_record(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "删除绑定关系失败"))?;
+
+    Ok(Json(ServerAgentBindingResponse::from_binding(
+        &server_uuid,
+        None,
+        None,
+    )))
 }
 
 async fn dispatch_agent_command<T>(
@@ -504,6 +637,41 @@ async fn initialize_database(db: &PgPool) -> Result<(), sqlx::Error> {
     .execute(db)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS server_agent_bindings (
+            server_uuid TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL UNIQUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname = 'server_agent_bindings_server_uuid_fkey'
+                  AND conrelid = 'server_agent_bindings'::regclass
+            ) THEN
+                ALTER TABLE server_agent_bindings
+                ADD CONSTRAINT server_agent_bindings_server_uuid_fkey
+                FOREIGN KEY (server_uuid)
+                REFERENCES managed_servers (server_uuid)
+                ON DELETE CASCADE;
+            END IF;
+        END $$;
+        "#,
+    )
+    .execute(db)
+    .await?;
+
     Ok(())
 }
 
@@ -521,6 +689,141 @@ async fn fetch_servers(db: &PgPool) -> Result<Vec<ManagedServer>, sqlx::Error> {
     Ok(rows)
 }
 
+#[derive(Clone, FromRow)]
+struct ServerAgentBindingRecord {
+    server_uuid: String,
+    agent_id: String,
+}
+
+async fn fetch_all_server_agent_bindings(
+    db: &PgPool,
+) -> Result<Vec<ServerAgentBindingRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ServerAgentBindingRecord>(
+        r#"
+        SELECT server_uuid, agent_id
+        FROM server_agent_bindings
+        "#,
+    )
+    .fetch_all(db)
+    .await
+}
+
+async fn fetch_server_agent_binding_by_server_uuid(
+    db: &PgPool,
+    server_uuid: &str,
+) -> Result<Option<ServerAgentBindingRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ServerAgentBindingRecord>(
+        r#"
+        SELECT server_uuid, agent_id
+        FROM server_agent_bindings
+        WHERE server_uuid = $1
+        "#,
+    )
+    .bind(server_uuid)
+    .fetch_optional(db)
+    .await
+}
+
+async fn fetch_server_agent_binding_by_agent_id(
+    db: &PgPool,
+    agent_id: &str,
+) -> Result<Option<ServerAgentBindingRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ServerAgentBindingRecord>(
+        r#"
+        SELECT server_uuid, agent_id
+        FROM server_agent_bindings
+        WHERE agent_id = $1
+        "#,
+    )
+    .bind(agent_id)
+    .fetch_optional(db)
+    .await
+}
+
+async fn upsert_server_agent_binding(
+    db: &PgPool,
+    server_uuid: &str,
+    agent_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO server_agent_bindings (server_uuid, agent_id)
+        VALUES ($1, $2)
+        ON CONFLICT (server_uuid) DO UPDATE
+        SET agent_id = EXCLUDED.agent_id,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(server_uuid)
+    .bind(agent_id)
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+async fn delete_server_agent_binding_record(
+    db: &PgPool,
+    server_uuid: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        DELETE FROM server_agent_bindings
+        WHERE server_uuid = $1
+        "#,
+    )
+    .bind(server_uuid)
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initialize_database_creates_server_agent_bindings_table_and_fk() {
+        let env_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
+        from_path_override(&env_path).ok();
+
+        let config = AppConfig::from_env();
+        let db = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&config.database_url)
+            .await
+            .expect("failed to connect to PostgreSQL");
+
+        initialize_database(&db)
+            .await
+            .expect("failed to initialize PostgreSQL schema");
+
+        let table_exists = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT to_regclass('public.server_agent_bindings')::text",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("failed to query server_agent_bindings table");
+
+        assert!(table_exists.is_some());
+
+        let constraint_count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM pg_constraint
+            WHERE conname = 'server_agent_bindings_server_uuid_fkey'
+              AND conrelid = 'server_agent_bindings'::regclass
+            "#,
+        )
+        .fetch_one(&db)
+        .await
+        .expect("failed to query server_agent_bindings foreign key");
+
+        assert!(constraint_count > 0);
+    }
+}
+
 async fn fetch_server_by_uuid(
     db: &PgPool,
     server_uuid: &str,
@@ -535,6 +838,21 @@ async fn fetch_server_by_uuid(
     .bind(server_uuid)
     .fetch_optional(db)
     .await
+}
+
+async fn server_exists(db: &PgPool, server_uuid: &str) -> Result<bool, sqlx::Error> {
+    let existing = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM managed_servers
+        WHERE server_uuid = $1
+        "#,
+    )
+    .bind(server_uuid)
+    .fetch_one(db)
+    .await?;
+
+    Ok(existing > 0)
 }
 
 async fn server_exists_for_other(

@@ -1,23 +1,130 @@
-use axum::Router;
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode},
+    Router,
+};
 use backend::{
     agent_registry::AgentRegistry,
     build_app_with_registry,
     models::{
         AgentClientMessage, AgentCommand, AgentCommandResult, AgentFileChanged, AgentHeartbeat,
         AgentLogChunk, AgentPlatform, AgentRegistration, AgentServerMessage, AgentStreamEvent,
-        LogEnvelope, WorkspaceRootSummary,
+        LogEnvelope, OnlineAgentSummary, WorkspaceRootSummary,
     },
 };
+use dotenvy::from_path_override;
 use futures::{SinkExt, StreamExt};
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
+use std::{env, path::Path};
+use tower::ServiceExt;
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use uuid::Uuid;
 
 fn make_lazy_db() -> sqlx::PgPool {
     PgPoolOptions::new()
         .connect_lazy("postgres://squad:squad@127.0.0.1:5432/squad")
         .expect("lazy pool should be constructed")
+}
+
+async fn make_test_db() -> sqlx::PgPool {
+    let env_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
+    from_path_override(&env_path).ok();
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL should exist");
+
+    PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("test db should connect")
+}
+
+async fn ensure_binding_tables(db: &sqlx::PgPool) {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS managed_servers (
+            id BIGSERIAL PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            ip TEXT NOT NULL,
+            rcon_port INTEGER NOT NULL,
+            rcon_password TEXT NOT NULL,
+            server_uuid TEXT NOT NULL UNIQUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (ip, rcon_port)
+        )
+        "#,
+    )
+    .execute(db)
+    .await
+    .expect("managed_servers table should exist");
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS server_agent_bindings (
+            server_uuid TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL UNIQUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(db)
+    .await
+    .expect("server_agent_bindings table should exist");
+}
+
+async fn insert_binding_fixture(db: &sqlx::PgPool, server_uuid: &str, agent_id: &str) {
+    ensure_binding_tables(db).await;
+    let rcon_port = 20000 + (server_uuid.bytes().fold(0_u16, |acc, byte| {
+        acc.wrapping_add(byte as u16)
+    }) % 20000);
+
+    sqlx::query(
+        r#"
+        INSERT INTO managed_servers (name, ip, rcon_port, rcon_password, server_uuid)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (server_uuid) DO UPDATE
+        SET name = EXCLUDED.name,
+            ip = EXCLUDED.ip,
+            rcon_port = EXCLUDED.rcon_port,
+            rcon_password = EXCLUDED.rcon_password
+        "#,
+    )
+    .bind(format!("test-server-{server_uuid}"))
+    .bind("127.0.0.1")
+    .bind(i32::from(rcon_port))
+    .bind("secret")
+    .bind(server_uuid)
+    .execute(db)
+    .await
+    .expect("managed server fixture should insert");
+
+    sqlx::query(
+        r#"
+        INSERT INTO server_agent_bindings (server_uuid, agent_id)
+        VALUES ($1, $2)
+        ON CONFLICT (server_uuid) DO UPDATE
+        SET agent_id = EXCLUDED.agent_id,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(server_uuid)
+    .bind(agent_id)
+    .execute(db)
+    .await
+    .expect("binding fixture should insert");
+}
+
+async fn cleanup_binding_fixture(db: &sqlx::PgPool, server_uuid: &str) {
+    let _ = sqlx::query("DELETE FROM server_agent_bindings WHERE server_uuid = $1")
+        .bind(server_uuid)
+        .execute(db)
+        .await;
+    let _ = sqlx::query("DELETE FROM managed_servers WHERE server_uuid = $1")
+        .bind(server_uuid)
+        .execute(db)
+        .await;
 }
 
 async fn spawn_app(app: Router) -> (String, JoinHandle<()>) {
@@ -36,7 +143,7 @@ async fn spawn_app(app: Router) -> (String, JoinHandle<()>) {
 async fn agent_websocket_route_accepts_upgrade() {
     let registry = AgentRegistry::default();
     let app = build_app_with_registry(make_lazy_db(), registry);
-    let (url, server) = spawn_app(app).await;
+    let (url, server) = spawn_app(app.clone()).await;
 
     let result = connect_async(&url).await;
 
@@ -48,7 +155,7 @@ async fn agent_websocket_route_accepts_upgrade() {
 async fn valid_registration_marks_agent_online_and_returns_ack() {
     let registry = AgentRegistry::default();
     let app = build_app_with_registry(make_lazy_db(), registry.clone());
-    let (url, server) = spawn_app(app).await;
+    let (url, server) = spawn_app(app.clone()).await;
     let (mut socket, _) = connect_async(&url)
         .await
         .expect("websocket upgrade should succeed");
@@ -109,7 +216,7 @@ async fn valid_registration_marks_agent_online_and_returns_ack() {
 async fn heartbeat_updates_agent_last_seen_timestamp() {
     let registry = AgentRegistry::default();
     let app = build_app_with_registry(make_lazy_db(), registry.clone());
-    let (url, server) = spawn_app(app).await;
+    let (url, server) = spawn_app(app.clone()).await;
     let (mut socket, _) = connect_async(&url)
         .await
         .expect("websocket upgrade should succeed");
@@ -178,7 +285,7 @@ async fn heartbeat_updates_agent_last_seen_timestamp() {
 async fn dispatch_command_bridges_response_between_backend_and_agent() {
     let registry = AgentRegistry::default();
     let app = build_app_with_registry(make_lazy_db(), registry.clone());
-    let (url, server) = spawn_app(app).await;
+    let (url, server) = spawn_app(app.clone()).await;
     let (mut socket, _) = connect_async(&url)
         .await
         .expect("websocket upgrade should succeed");
@@ -263,7 +370,7 @@ async fn dispatch_command_bridges_response_between_backend_and_agent() {
 async fn log_chunk_is_broadcast_to_agent_event_subscribers() {
     let registry = AgentRegistry::default();
     let app = build_app_with_registry(make_lazy_db(), registry.clone());
-    let (url, server) = spawn_app(app).await;
+    let (url, server) = spawn_app(app.clone()).await;
     let (mut socket, _) = connect_async(&url)
         .await
         .expect("websocket upgrade should succeed");
@@ -390,5 +497,128 @@ async fn file_change_is_broadcast_to_agent_event_subscribers() {
         other => panic!("unexpected event: {other:?}"),
     }
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn online_agents_route_returns_binding_state_for_registered_agents() {
+    let db = make_test_db().await;
+    let server_uuid = format!("server-{}", Uuid::new_v4());
+    insert_binding_fixture(&db, &server_uuid, "agent-1").await;
+
+    let registry = AgentRegistry::default();
+    let app = build_app_with_registry(db.clone(), registry.clone());
+    let (url, server) = spawn_app(app.clone()).await;
+    let (mut socket_1, _) = connect_async(&url).await.expect("ws should connect");
+    let (mut socket_2, _) = connect_async(&url).await.expect("ws should connect");
+
+    let registration_1 = AgentClientMessage::Register(AgentRegistration {
+        agent_id: "agent-1".to_string(),
+        token: "test-token".to_string(),
+        platform: AgentPlatform::Linux,
+        version: "0.1.0".to_string(),
+        workspace_roots: vec![],
+        primary_log_path: "/srv/game/server.log".to_string(),
+    });
+    let registration_2 = AgentClientMessage::Register(AgentRegistration {
+        agent_id: "agent-2".to_string(),
+        token: "test-token".to_string(),
+        platform: AgentPlatform::Linux,
+        version: "0.1.0".to_string(),
+        workspace_roots: vec![],
+        primary_log_path: "/srv/game/second.log".to_string(),
+    });
+
+    socket_1
+        .send(Message::Text(
+            serde_json::to_string(&registration_1)
+                .expect("registration json")
+                .into(),
+        ))
+        .await
+        .expect("registration should send");
+    let ack_1 = socket_1
+        .next()
+        .await
+        .expect("ack frame should exist")
+        .expect("ack frame should be readable");
+    let ack_1 = serde_json::from_str::<AgentServerMessage>(
+        ack_1.into_text().expect("ack should be text").as_ref(),
+    )
+    .expect("ack should be valid json");
+    match ack_1 {
+        AgentServerMessage::Registered(payload) => {
+            assert_eq!(payload.agent_id, "agent-1");
+            assert!(!payload.session_id.is_empty());
+        }
+        AgentServerMessage::Command(_) => panic!("unexpected command before dispatch"),
+    }
+
+    socket_2
+        .send(Message::Text(
+            serde_json::to_string(&registration_2)
+                .expect("registration json")
+                .into(),
+        ))
+        .await
+        .expect("registration should send");
+    let ack_2 = socket_2
+        .next()
+        .await
+        .expect("ack frame should exist")
+        .expect("ack frame should be readable");
+    let ack_2 = serde_json::from_str::<AgentServerMessage>(
+        ack_2.into_text().expect("ack should be text").as_ref(),
+    )
+    .expect("ack should be valid json");
+    match ack_2 {
+        AgentServerMessage::Registered(payload) => {
+            assert_eq!(payload.agent_id, "agent-2");
+            assert!(!payload.session_id.is_empty());
+        }
+        AgentServerMessage::Command(_) => panic!("unexpected command before dispatch"),
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/agents/online")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+    let agents: Vec<OnlineAgentSummary> =
+        serde_json::from_slice(&body).expect("response body should be valid json");
+
+    assert_eq!(agents.len(), 2);
+
+    let agent_1 = agents
+        .iter()
+        .find(|agent| agent.agent_id == "agent-1")
+        .expect("agent-1 should exist");
+    assert_eq!(agent_1.platform, AgentPlatform::Linux);
+    assert_eq!(agent_1.version, "0.1.0");
+    assert_eq!(agent_1.primary_log_path, "/srv/game/server.log");
+    assert!(agent_1.is_bound);
+    assert_eq!(agent_1.bound_server_uuid, Some(server_uuid.clone()));
+
+    let agent_2 = agents
+        .iter()
+        .find(|agent| agent.agent_id == "agent-2")
+        .expect("agent-2 should exist");
+    assert_eq!(agent_2.platform, AgentPlatform::Linux);
+    assert_eq!(agent_2.version, "0.1.0");
+    assert_eq!(agent_2.primary_log_path, "/srv/game/second.log");
+    assert!(!agent_2.is_bound);
+    assert_eq!(agent_2.bound_server_uuid, None);
+
+    cleanup_binding_fixture(&db, &server_uuid).await;
     server.abort();
 }
