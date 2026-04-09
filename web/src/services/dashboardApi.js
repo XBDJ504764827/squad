@@ -95,6 +95,15 @@ export const dashboardApi = {
   async getServerParseRules(serverUuid) {
     return request(`/servers/${serverUuid}/parse-rules`)
   },
+  async getServerFeatureFlags(serverUuid) {
+    return request(`/servers/${serverUuid}/feature-flags`)
+  },
+  async updateServerFeatureFlag(serverUuid, featureKey, payload) {
+    return request(`/servers/${serverUuid}/feature-flags/${featureKey}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    })
+  },
   async updateServerParseRules(serverUuid, payload) {
     return request(`/servers/${serverUuid}/parse-rules`, {
       method: 'PUT',

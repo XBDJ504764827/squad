@@ -353,6 +353,25 @@ pub struct ServerAgentAuthResponse {
     pub primary_log_path: String,
 }
 
+#[derive(Clone, Serialize, Deserialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerFeatureFlagsResponse {
+    pub server_uuid: String,
+    pub disable_vehicle_claiming: bool,
+    pub force_all_vehicle_availability: bool,
+    pub force_all_deployable_availability: bool,
+    pub force_all_role_availability: bool,
+    pub disable_vehicle_team_requirement: bool,
+    pub disable_vehicle_kit_requirement: bool,
+    pub no_respawn_timer: bool,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateServerFeatureFlagRequest {
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ParseRuleKind {
@@ -798,6 +817,92 @@ impl ServerAgentAuthResponse {
     }
 }
 
+impl ServerFeatureFlagsResponse {
+    pub fn all_disabled(server_uuid: &str) -> Self {
+        Self {
+            server_uuid: server_uuid.to_string(),
+            disable_vehicle_claiming: false,
+            force_all_vehicle_availability: false,
+            force_all_deployable_availability: false,
+            force_all_role_availability: false,
+            disable_vehicle_team_requirement: false,
+            disable_vehicle_kit_requirement: false,
+            no_respawn_timer: false,
+        }
+    }
+
+    pub fn set_feature_enabled(
+        &mut self,
+        feature_key: &str,
+        enabled: bool,
+    ) -> Result<&'static str, String> {
+        match feature_key {
+            "disableVehicleClaiming" => {
+                self.disable_vehicle_claiming = enabled;
+                Ok("AdminDisableVehicleClaiming")
+            }
+            "forceAllVehicleAvailability" => {
+                self.force_all_vehicle_availability = enabled;
+                Ok("AdminForceAllVehicleAvailability")
+            }
+            "forceAllDeployableAvailability" => {
+                self.force_all_deployable_availability = enabled;
+                Ok("AdminForceAllDeployableAvailability")
+            }
+            "forceAllRoleAvailability" => {
+                self.force_all_role_availability = enabled;
+                Ok("AdminForceAllRoleAvailability")
+            }
+            "disableVehicleTeamRequirement" => {
+                self.disable_vehicle_team_requirement = enabled;
+                Ok("AdminDisableVehicleTeamRequirement")
+            }
+            "disableVehicleKitRequirement" => {
+                self.disable_vehicle_kit_requirement = enabled;
+                Ok("AdminDisableVehicleKitRequirement")
+            }
+            "noRespawnTimer" => {
+                self.no_respawn_timer = enabled;
+                Ok("AdminNoRespawnTimer")
+            }
+            _ => Err("未知的服务器功能开关".to_string()),
+        }
+    }
+
+    pub fn to_rcon_commands(&self) -> [String; 7] {
+        [
+            format!(
+                "AdminDisableVehicleClaiming {}",
+                bool_to_rcon_flag(self.disable_vehicle_claiming)
+            ),
+            format!(
+                "AdminForceAllVehicleAvailability {}",
+                bool_to_rcon_flag(self.force_all_vehicle_availability)
+            ),
+            format!(
+                "AdminForceAllDeployableAvailability {}",
+                bool_to_rcon_flag(self.force_all_deployable_availability)
+            ),
+            format!(
+                "AdminForceAllRoleAvailability {}",
+                bool_to_rcon_flag(self.force_all_role_availability)
+            ),
+            format!(
+                "AdminDisableVehicleTeamRequirement {}",
+                bool_to_rcon_flag(self.disable_vehicle_team_requirement)
+            ),
+            format!(
+                "AdminDisableVehicleKitRequirement {}",
+                bool_to_rcon_flag(self.disable_vehicle_kit_requirement)
+            ),
+            format!(
+                "AdminNoRespawnTimer {}",
+                bool_to_rcon_flag(self.no_respawn_timer)
+            ),
+        ]
+    }
+}
+
 impl ServerParseRulesResponse {
     pub fn from_rules(
         server_uuid: &str,
@@ -858,6 +963,10 @@ fn empty_stat(
         sparkline_color: sparkline_color.to_string(),
         sparkline_data: vec![],
     }
+}
+
+fn bool_to_rcon_flag(value: bool) -> u8 {
+    if value { 1 } else { 0 }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

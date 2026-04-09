@@ -13,7 +13,7 @@ use axum::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use dotenvy::dotenv;
 #[cfg(test)]
@@ -25,8 +25,9 @@ use models::{
     FileTreeResult, FileWriteRequest, FileWriteRequestBody, FileWriteResult, HealthResponse,
     ManagedServer, ManagedServerDetailResponse, OnlineAgent, OnlineAgentSummary, ParseRule,
     ParseRuleKind, ParsedEventQuery, ParsedLogEvent, ReplaceParseRulesRequest,
-    ServerAgentAuthResponse, ServerParsedEventsResponse, ServerParseRulesResponse,
-    UpdateServerParseRulesRequest, UpdateServerRequest,
+    ServerAgentAuthResponse, ServerFeatureFlagsResponse, ServerParsedEventsResponse,
+    ServerParseRulesResponse, UpdateServerFeatureFlagRequest, UpdateServerParseRulesRequest,
+    UpdateServerRequest,
 };
 use regex::Regex;
 use serde::de::DeserializeOwned;
@@ -129,6 +130,14 @@ pub fn build_app_with_registry(db: PgPool, agent_registry: AgentRegistry) -> Rou
         .route(
             "/api/servers/{server_uuid}",
             get(get_server).put(update_server).delete(delete_server),
+        )
+        .route(
+            "/api/servers/{server_uuid}/feature-flags",
+            get(get_server_feature_flags),
+        )
+        .route(
+            "/api/servers/{server_uuid}/feature-flags/{feature_key}",
+            put(put_server_feature_flag),
         )
         .route("/api/servers/{server_uuid}/agent-auth", get(get_server_agent_auth))
         .route(
@@ -466,6 +475,27 @@ async fn get_server_agent_auth(
     )))
 }
 
+async fn get_server_feature_flags(
+    AxumPath(server_uuid): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<ServerFeatureFlagsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let server = fetch_server_by_uuid(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器失败"))?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "服务器不存在"))?;
+
+    let flags = fetch_server_feature_flags_by_server_uuid(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器功能状态失败"))?
+        .unwrap_or_else(|| ServerFeatureFlagsResponse::all_disabled(&server_uuid));
+
+    replay_server_feature_flags(&server, &flags)
+        .await
+        .map_err(|message| error_response(StatusCode::BAD_GATEWAY, &message))?;
+
+    Ok(Json(flags))
+}
+
 async fn post_server_agent_auth_key(
     AxumPath(server_uuid): AxumPath<String>,
     State(state): State<AppState>,
@@ -492,6 +522,37 @@ async fn post_server_agent_auth_key(
         Some(plain_key),
         online_agent.as_ref(),
     )))
+}
+
+async fn put_server_feature_flag(
+    AxumPath((server_uuid, feature_key)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+    Json(payload): Json<UpdateServerFeatureFlagRequest>,
+) -> Result<Json<ServerFeatureFlagsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let server = fetch_server_by_uuid(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器失败"))?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "服务器不存在"))?;
+
+    let mut flags = fetch_server_feature_flags_by_server_uuid(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器功能状态失败"))?
+        .unwrap_or_else(|| ServerFeatureFlagsResponse::all_disabled(&server_uuid));
+
+    let command_name = flags
+        .set_feature_enabled(&feature_key, payload.enabled)
+        .map_err(|message| error_response(StatusCode::BAD_REQUEST, &message))?;
+    let command = format!("{command_name} {}", if payload.enabled { 1 } else { 0 });
+
+    rcon::execute_rcon_command(&server.ip, server.rcon_port as u16, &server.rcon_password, &command)
+        .await
+        .map_err(|message| error_response(StatusCode::BAD_GATEWAY, &message))?;
+
+    upsert_server_feature_flags(&state.db, &flags)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "写入服务器功能状态失败"))?;
+
+    Ok(Json(flags))
 }
 
 async fn get_server_parse_rules(
@@ -926,6 +987,59 @@ async fn initialize_database(db: &PgPool) -> Result<(), sqlx::Error> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS server_feature_flags (
+            server_uuid TEXT PRIMARY KEY,
+            disable_vehicle_claiming BOOLEAN NOT NULL DEFAULT FALSE,
+            force_all_vehicle_availability BOOLEAN NOT NULL DEFAULT FALSE,
+            force_all_deployable_availability BOOLEAN NOT NULL DEFAULT FALSE,
+            force_all_role_availability BOOLEAN NOT NULL DEFAULT FALSE,
+            disable_vehicle_team_requirement BOOLEAN NOT NULL DEFAULT FALSE,
+            disable_vehicle_kit_requirement BOOLEAN NOT NULL DEFAULT FALSE,
+            no_respawn_timer BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM server_feature_flags
+        WHERE server_uuid NOT IN (
+            SELECT server_uuid
+            FROM managed_servers
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname = 'server_feature_flags_server_uuid_fkey'
+                  AND conrelid = 'server_feature_flags'::regclass
+            ) THEN
+                ALTER TABLE server_feature_flags
+                ADD CONSTRAINT server_feature_flags_server_uuid_fkey
+                FOREIGN KEY (server_uuid)
+                REFERENCES managed_servers (server_uuid)
+                ON DELETE CASCADE;
+            END IF;
+        END $$;
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS server_parse_rules (
             server_uuid TEXT PRIMARY KEY,
             rules_json JSONB NOT NULL,
@@ -1071,6 +1185,8 @@ struct ServerAgentAuthRecord {
     rotated_at_ms: i64,
 }
 
+type ServerFeatureFlagsRecord = ServerFeatureFlagsResponse;
+
 #[derive(Clone, FromRow)]
 pub(crate) struct ServerParseRulesRecord {
     _server_uuid: String,
@@ -1104,6 +1220,30 @@ async fn fetch_server_agent_auth_by_server_uuid(
             key_preview,
             CAST(EXTRACT(EPOCH FROM rotated_at) * 1000 AS BIGINT) AS rotated_at_ms
         FROM server_agent_auth
+        WHERE server_uuid = $1
+        "#,
+    )
+    .bind(server_uuid)
+    .fetch_optional(db)
+    .await
+}
+
+async fn fetch_server_feature_flags_by_server_uuid(
+    db: &PgPool,
+    server_uuid: &str,
+) -> Result<Option<ServerFeatureFlagsRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ServerFeatureFlagsRecord>(
+        r#"
+        SELECT
+            server_uuid,
+            disable_vehicle_claiming,
+            force_all_vehicle_availability,
+            force_all_deployable_availability,
+            force_all_role_availability,
+            disable_vehicle_team_requirement,
+            disable_vehicle_kit_requirement,
+            no_respawn_timer
+        FROM server_feature_flags
         WHERE server_uuid = $1
         "#,
     )
@@ -1150,6 +1290,48 @@ async fn upsert_server_parse_rules(
     .bind(server_uuid)
     .bind(SqlxJson(rules.to_vec()))
     .bind(version as i64)
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+async fn upsert_server_feature_flags(
+    db: &PgPool,
+    flags: &ServerFeatureFlagsResponse,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO server_feature_flags (
+            server_uuid,
+            disable_vehicle_claiming,
+            force_all_vehicle_availability,
+            force_all_deployable_availability,
+            force_all_role_availability,
+            disable_vehicle_team_requirement,
+            disable_vehicle_kit_requirement,
+            no_respawn_timer
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (server_uuid) DO UPDATE
+        SET disable_vehicle_claiming = EXCLUDED.disable_vehicle_claiming,
+            force_all_vehicle_availability = EXCLUDED.force_all_vehicle_availability,
+            force_all_deployable_availability = EXCLUDED.force_all_deployable_availability,
+            force_all_role_availability = EXCLUDED.force_all_role_availability,
+            disable_vehicle_team_requirement = EXCLUDED.disable_vehicle_team_requirement,
+            disable_vehicle_kit_requirement = EXCLUDED.disable_vehicle_kit_requirement,
+            no_respawn_timer = EXCLUDED.no_respawn_timer,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(&flags.server_uuid)
+    .bind(flags.disable_vehicle_claiming)
+    .bind(flags.force_all_vehicle_availability)
+    .bind(flags.force_all_deployable_availability)
+    .bind(flags.force_all_role_availability)
+    .bind(flags.disable_vehicle_team_requirement)
+    .bind(flags.disable_vehicle_kit_requirement)
+    .bind(flags.no_respawn_timer)
     .execute(db)
     .await?;
 
@@ -1670,6 +1852,18 @@ async fn update_server_record(
     .await?;
 
     Ok(result.rows_affected() > 0)
+}
+
+async fn replay_server_feature_flags(
+    server: &ManagedServer,
+    flags: &ServerFeatureFlagsResponse,
+) -> Result<(), String> {
+    for command in flags.to_rcon_commands() {
+        rcon::execute_rcon_command(&server.ip, server.rcon_port as u16, &server.rcon_password, &command)
+            .await?;
+    }
+
+    Ok(())
 }
 
 async fn delete_server_record(db: &PgPool, server_uuid: &str) -> Result<bool, sqlx::Error> {

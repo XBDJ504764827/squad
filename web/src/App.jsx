@@ -615,6 +615,19 @@ function createEmptyStructuredEventErrors() {
   }
 }
 
+function createEmptyServerFeatureFlags(serverUuid = '') {
+  return {
+    serverUuid,
+    disableVehicleClaiming: false,
+    forceAllVehicleAvailability: false,
+    forceAllDeployableAvailability: false,
+    forceAllRoleAvailability: false,
+    disableVehicleTeamRequirement: false,
+    disableVehicleKitRequirement: false,
+    noRespawnTimer: false,
+  }
+}
+
 function App() {
   const [dashboard, setDashboard] = useState(EMPTY_DASHBOARD)
   const [theme, setTheme] = useState('light')
@@ -677,6 +690,10 @@ function App() {
   const [isServerParseRulesLoading, setIsServerParseRulesLoading] = useState(false)
   const [isServerParseRulesSaving, setIsServerParseRulesSaving] = useState(false)
   const [serverParseRulesError, setServerParseRulesError] = useState('')
+  const [serverFeatureFlags, setServerFeatureFlags] = useState(createEmptyServerFeatureFlags)
+  const [isServerFeatureFlagsLoading, setIsServerFeatureFlagsLoading] = useState(false)
+  const [serverFeatureFlagsError, setServerFeatureFlagsError] = useState('')
+  const [pendingServerFeatureKey, setPendingServerFeatureKey] = useState('')
   const [structuredEventItems, setStructuredEventItems] = useState(createEmptyStructuredEventItems)
   const [structuredEventLoading, setStructuredEventLoading] = useState(createEmptyStructuredEventLoading)
   const [structuredEventErrors, setStructuredEventErrors] = useState(createEmptyStructuredEventErrors)
@@ -782,6 +799,24 @@ function App() {
       throw new Error(message)
     } finally {
       setIsServerParseRulesLoading(false)
+    }
+  }
+
+  const loadServerFeatureFlags = async (serverUuid) => {
+    setIsServerFeatureFlagsLoading(true)
+    setServerFeatureFlagsError('')
+
+    try {
+      const payload = await dashboardApi.getServerFeatureFlags(serverUuid)
+      setServerFeatureFlags(payload)
+      return payload
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '读取服务器功能状态失败'
+      setServerFeatureFlags(createEmptyServerFeatureFlags(serverUuid))
+      setServerFeatureFlagsError(message)
+      throw new Error(message)
+    } finally {
+      setIsServerFeatureFlagsLoading(false)
     }
   }
 
@@ -899,6 +934,10 @@ function App() {
     setServerParseRules({ version: null, rules: [], applied: false, message: '' })
     setServerParseRulesDraft('[]')
     setServerParseRulesError('')
+    setServerFeatureFlags(createEmptyServerFeatureFlags(selectedServerUuid ?? ''))
+    setIsServerFeatureFlagsLoading(false)
+    setServerFeatureFlagsError('')
+    setPendingServerFeatureKey('')
     setStructuredEventItems(createEmptyStructuredEventItems())
     setStructuredEventLoading(createEmptyStructuredEventLoading())
     setStructuredEventErrors(createEmptyStructuredEventErrors())
@@ -1033,6 +1072,24 @@ function App() {
     let cancelled = false
 
     loadServerParseRules(selectedServerUuid).catch(() => {
+      if (cancelled) {
+        return
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeView, normalizedWorkbenchSection, selectedServerUuid])
+
+  useEffect(() => {
+    if (activeView !== 'server-detail' || normalizedWorkbenchSection !== 'control' || !selectedServerUuid) {
+      return undefined
+    }
+
+    let cancelled = false
+
+    loadServerFeatureFlags(selectedServerUuid).catch(() => {
       if (cancelled) {
         return
       }
@@ -1209,6 +1266,9 @@ function App() {
           if (activeView === 'server-detail' && normalizedWorkbenchSection === 'parse-rules') {
             await loadServerParseRules(selectedServerUuid)
           }
+          if (activeView === 'server-detail' && normalizedWorkbenchSection === 'control') {
+            await loadServerFeatureFlags(selectedServerUuid)
+          }
           if (
             activeView === 'server-detail' &&
             STRUCTURED_EVENT_TYPES.includes(normalizedWorkbenchSection)
@@ -1281,6 +1341,26 @@ function App() {
       setServerParseRulesError(error instanceof Error ? error.message : '保存解析规则失败')
     } finally {
       setIsServerParseRulesSaving(false)
+    }
+  }
+
+  const handleToggleServerFeatureFlag = async (featureKey, enabled) => {
+    if (!selectedServerUuid || isServerFeatureFlagsLoading || pendingServerFeatureKey) {
+      return
+    }
+
+    setPendingServerFeatureKey(featureKey)
+    setServerFeatureFlagsError('')
+
+    try {
+      const payload = await dashboardApi.updateServerFeatureFlag(selectedServerUuid, featureKey, {
+        enabled,
+      })
+      setServerFeatureFlags(payload)
+    } catch (error) {
+      setServerFeatureFlagsError(error instanceof Error ? error.message : '更新服务器功能失败')
+    } finally {
+      setPendingServerFeatureKey('')
     }
   }
 
@@ -1728,42 +1808,47 @@ function App() {
           )
         case 'control':
           return (
-            <div className="workbench-stack">
-              <div className="workbench-control-grid">
-                {sectionContent.actionGroups.map((group) => (
-                  <div className="card" key={group.title}>
-                    <div className="card-header">
-                      <div>
-                        <div className="card-title">{group.title}</div>
-                        <div className="card-subtitle">当前阶段仅提供 UI 结构，按钮不执行实际动作。</div>
+            <div className="card">
+              <div className="card-header">
+                <div>
+                  <div className="card-title">{sectionContent.title}</div>
+                  <div className="card-subtitle">{sectionContent.subtitle}</div>
+                </div>
+                <div className="workbench-feature-summary">
+                  <span>状态同步</span>
+                  <strong>{isServerFeatureFlagsLoading ? '同步中…' : '已加载'}</strong>
+                </div>
+              </div>
+              {serverFeatureFlagsError ? <div className="form-error workbench-inline-error">{serverFeatureFlagsError}</div> : null}
+              <div className="workbench-feature-list">
+                {sectionContent.features.map((feature) => {
+                  const enabled = Boolean(serverFeatureFlags?.[feature.key])
+                  const isPending = pendingServerFeatureKey === feature.key
+
+                  return (
+                    <div className="workbench-feature-row" key={feature.key}>
+                      <div className="workbench-feature-copy">
+                        <strong>{feature.label}</strong>
+                        <span>{feature.description}</span>
+                        <code>{`${feature.command} ${enabled ? 1 : 0}`}</code>
+                      </div>
+                      <div className="workbench-feature-actions">
+                        <span className={`workbench-feature-status${enabled ? ' active' : ''}`}>
+                          {isPending ? '保存中…' : enabled ? '已开启' : '已关闭'}
+                        </span>
+                        <button
+                          className={`workbench-feature-toggle${enabled ? ' active' : ''}`}
+                          type="button"
+                          aria-pressed={enabled}
+                          disabled={isServerFeatureFlagsLoading || isPending}
+                          onClick={() => handleToggleServerFeatureFlag(feature.key, !enabled)}
+                        >
+                          <span></span>
+                        </button>
                       </div>
                     </div>
-                    <div className="workbench-action-grid">
-                      {group.items.map((item) => (
-                        <button className="workbench-action-tile" key={item} type="button">
-                          <span>{item}</span>
-                          <small>开发中</small>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <div className="card">
-                <div className="card-header">
-                  <div>
-                    <div className="card-title">安全约束</div>
-                    <div className="card-subtitle">用于展示未来控制操作的执行规则。</div>
-                  </div>
-                </div>
-                <div className="workbench-bullet-list">
-                  {sectionContent.safety.map((item) => (
-                    <div className="workbench-bullet-item" key={item}>
-                      <span className="workbench-bullet-dot"></span>
-                      {item}
-                    </div>
-                  ))}
-                </div>
+                  )
+                })}
               </div>
             </div>
           )

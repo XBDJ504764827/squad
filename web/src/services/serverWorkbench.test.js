@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 
 import {
   SERVER_WORKBENCH_SECTIONS,
+  SERVER_FEATURE_FLAG_ITEMS,
   appendAgentLogChunk,
   appendRealtimeLogEntry,
   buildStructuredEventItems,
@@ -34,6 +35,23 @@ test('SERVER_WORKBENCH_SECTIONS contains all expected management modules', () =>
       'permissions',
     ],
   )
+})
+
+test('SERVER_FEATURE_FLAG_ITEMS contains all required feature switches', () => {
+  assert.deepEqual(
+    SERVER_FEATURE_FLAG_ITEMS.map((item) => item.key),
+    [
+      'disableVehicleClaiming',
+      'forceAllVehicleAvailability',
+      'forceAllDeployableAvailability',
+      'forceAllRoleAvailability',
+      'disableVehicleTeamRequirement',
+      'disableVehicleKitRequirement',
+      'noRespawnTimer',
+    ],
+  )
+  assert.equal(SERVER_FEATURE_FLAG_ITEMS[0].command, 'AdminDisableVehicleClaiming')
+  assert.equal(SERVER_FEATURE_FLAG_ITEMS.at(-1).command, 'AdminNoRespawnTimer')
 })
 
 test('normalizeWorkbenchSection falls back to overview when section id is unknown', () => {

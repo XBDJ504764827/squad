@@ -16,6 +16,51 @@ export const SERVER_WORKBENCH_SECTIONS = [
   { id: 'permissions', label: '权限设置', icon: 'key-round', description: '查看角色、权限范围和审计策略。' },
 ]
 
+export const SERVER_FEATURE_FLAG_ITEMS = [
+  {
+    key: 'disableVehicleClaiming',
+    label: '取消载具认领权限',
+    command: 'AdminDisableVehicleClaiming',
+    description: '允许关闭载具认领限制，命令值 1 为启用该功能。',
+  },
+  {
+    key: 'forceAllVehicleAvailability',
+    label: '始终填满所有载具刷新位置',
+    command: 'AdminForceAllVehicleAvailability',
+    description: '强制所有载具刷新位始终可用，命令值 1 为启用该功能。',
+  },
+  {
+    key: 'forceAllDeployableAvailability',
+    label: '取消部署要求限制',
+    command: 'AdminForceAllDeployableAvailability',
+    description: '移除部署物建造条件限制，命令值 1 为启用该功能。',
+  },
+  {
+    key: 'forceAllRoleAvailability',
+    label: '取消装具人数限制',
+    command: 'AdminForceAllRoleAvailability',
+    description: '移除兵种人数占用限制，命令值 1 为启用该功能。',
+  },
+  {
+    key: 'disableVehicleTeamRequirement',
+    label: '可以使用敌方载具',
+    command: 'AdminDisableVehicleTeamRequirement',
+    description: '允许无视阵营限制使用敌方载具，命令值 1 为启用该功能。',
+  },
+  {
+    key: 'disableVehicleKitRequirement',
+    label: '取消坦克飞机载具装要求',
+    command: 'AdminDisableVehicleKitRequirement',
+    description: '移除重型载具所需兵种要求，命令值 1 为启用该功能。',
+  },
+  {
+    key: 'noRespawnTimer',
+    label: '取消复活时间',
+    command: 'AdminNoRespawnTimer',
+    description: '移除玩家复活等待时间，命令值 1 为启用该功能。',
+  },
+]
+
 const SECTION_IDS = new Set(SERVER_WORKBENCH_SECTIONS.map((section) => section.id))
 
 export function normalizeWorkbenchSection(sectionId) {
@@ -300,25 +345,9 @@ export function createServerWorkbenchContent(server) {
       ],
     },
     control: {
-      actionGroups: [
-        {
-          title: '生命周期',
-          items: ['启动服务器', '停止服务器', '重启服务器', '进入维护模式'],
-        },
-        {
-          title: '发布与回滚',
-          items: ['同步配置', '执行热更新', '回滚上个版本', '清理临时文件'],
-        },
-        {
-          title: '系统工具',
-          items: ['查看控制台', '下载日志包', '刷新节点状态', '重新验证 RCON'],
-        },
-      ],
-      safety: [
-        '敏感动作需要二次确认',
-        '高风险操作需要管理员授权',
-        '执行结果将写入操作记录',
-      ],
+      title: '服务器功能',
+      subtitle: '通过真实 RCON 命令控制 Squad 服务器功能，页面读取时会按后台记录重新纠偏。',
+      features: SERVER_FEATURE_FLAG_ITEMS,
     },
     'realtime-logs': {
       connectionLabel: '已连接日志频道',

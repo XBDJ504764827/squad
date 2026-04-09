@@ -1,6 +1,8 @@
 use std::{
     env,
+    io,
     path::Path,
+    sync::{Arc, Mutex},
     sync::atomic::{AtomicU16, Ordering},
 };
 
@@ -18,6 +20,11 @@ use backend::{
 use dotenvy::from_path_override;
 use serde::{Deserialize, de::DeserializeOwned};
 use sqlx::postgres::PgPoolOptions;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    task::JoinHandle,
+};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -36,6 +43,19 @@ struct ServerAgentAuthResponse {
     last_heartbeat_at: Option<u64>,
     workspace_roots: Vec<WorkspaceRootSummary>,
     primary_log_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerFeatureFlagsResponse {
+    server_uuid: String,
+    disable_vehicle_claiming: bool,
+    force_all_vehicle_availability: bool,
+    force_all_deployable_availability: bool,
+    force_all_role_availability: bool,
+    disable_vehicle_team_requirement: bool,
+    disable_vehicle_kit_requirement: bool,
+    no_respawn_timer: bool,
 }
 
 fn make_lazy_db() -> sqlx::PgPool {
@@ -90,6 +110,26 @@ async fn ensure_server_tables(db: &sqlx::PgPool) {
     .execute(db)
     .await
     .expect("server_agent_auth table should exist");
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS server_feature_flags (
+            server_uuid TEXT PRIMARY KEY,
+            disable_vehicle_claiming BOOLEAN NOT NULL DEFAULT FALSE,
+            force_all_vehicle_availability BOOLEAN NOT NULL DEFAULT FALSE,
+            force_all_deployable_availability BOOLEAN NOT NULL DEFAULT FALSE,
+            force_all_role_availability BOOLEAN NOT NULL DEFAULT FALSE,
+            disable_vehicle_team_requirement BOOLEAN NOT NULL DEFAULT FALSE,
+            disable_vehicle_kit_requirement BOOLEAN NOT NULL DEFAULT FALSE,
+            no_respawn_timer BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(db)
+    .await
+    .expect("server_feature_flags table should exist");
 }
 
 fn next_test_rcon_port() -> i32 {
@@ -121,6 +161,10 @@ async fn insert_server_fixture(db: &sqlx::PgPool, server_uuid: &str) {
 }
 
 async fn cleanup_server_fixture(db: &sqlx::PgPool, server_uuid: &str) {
+    let _ = sqlx::query("DELETE FROM server_feature_flags WHERE server_uuid = $1")
+        .bind(server_uuid)
+        .execute(db)
+        .await;
     let _ = sqlx::query("DELETE FROM server_agent_auth WHERE server_uuid = $1")
         .bind(server_uuid)
         .execute(db)
@@ -136,6 +180,88 @@ async fn read_json<T: DeserializeOwned>(response: axum::response::Response) -> T
         .await
         .expect("response body should read");
     serde_json::from_slice(&body).expect("response body should be valid json")
+}
+
+async fn write_rcon_packet(
+    stream: &mut tokio::net::TcpStream,
+    request_id: i32,
+    packet_type: i32,
+    body: &str,
+) -> io::Result<()> {
+    let body_bytes = body.as_bytes();
+    let packet_size = 4 + 4 + body_bytes.len() + 2;
+    let packet_size =
+        i32::try_from(packet_size).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "packet too large"))?;
+
+    stream.write_i32_le(packet_size).await?;
+    stream.write_i32_le(request_id).await?;
+    stream.write_i32_le(packet_type).await?;
+    stream.write_all(body_bytes).await?;
+    stream.write_all(&[0, 0]).await?;
+    stream.flush().await?;
+
+    Ok(())
+}
+
+async fn read_rcon_packet(stream: &mut tokio::net::TcpStream) -> io::Result<(i32, i32, String)> {
+    let packet_size = stream.read_i32_le().await?;
+    let request_id = stream.read_i32_le().await?;
+    let packet_type = stream.read_i32_le().await?;
+    let body_size = usize::try_from(packet_size - 10)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid body size"))?;
+    let mut body = vec![0_u8; body_size];
+    stream.read_exact(&mut body).await?;
+    let mut terminator = [0_u8; 2];
+    stream.read_exact(&mut terminator).await?;
+
+    Ok((request_id, packet_type, String::from_utf8_lossy(&body).to_string()))
+}
+
+async fn spawn_mock_rcon_server() -> (u16, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock rcon listener should bind");
+    let port = listener
+        .local_addr()
+        .expect("mock rcon listener should have local addr")
+        .port();
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let commands_for_task = Arc::clone(&commands);
+
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let commands = Arc::clone(&commands_for_task);
+
+            tokio::spawn(async move {
+                let Ok((request_id, packet_type, body)) = read_rcon_packet(&mut stream).await else {
+                    return;
+                };
+
+                if packet_type != 3 || body != "secret" {
+                    let _ = write_rcon_packet(&mut stream, -1, 2, "").await;
+                    return;
+                }
+
+                if write_rcon_packet(&mut stream, request_id, 2, "").await.is_err() {
+                    return;
+                }
+
+                while let Ok((request_id, packet_type, body)) = read_rcon_packet(&mut stream).await {
+                    if packet_type != 2 {
+                        continue;
+                    }
+
+                    commands.lock().expect("commands lock").push(body.clone());
+                    let _ = write_rcon_packet(&mut stream, request_id, 0, "OK").await;
+                }
+            });
+        }
+    });
+
+    (port, commands, task)
 }
 
 #[tokio::test]
@@ -322,6 +448,38 @@ async fn server_agent_auth_routes_exist() {
         .await
         .expect("response should be returned");
     assert_ne!(post_response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn server_feature_flag_routes_exist() {
+    let db = make_lazy_db();
+    let app = build_app(db);
+
+    let get_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/servers/test-server-uuid/feature-flags")
+                .method("GET")
+                .body(Body::empty())
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+    assert_ne!(get_response.status(), StatusCode::NOT_FOUND);
+
+    let put_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/servers/test-server-uuid/feature-flags/disableVehicleClaiming")
+                .method("PUT")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"enabled":true}"#))
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+    assert_ne!(put_response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -516,4 +674,205 @@ async fn post_server_agent_auth_key_rotates_key_and_get_reads_status() {
     assert_eq!(get_body.key_preview, second_body.key_preview);
 
     cleanup_server_fixture(&db, &server_uuid).await;
+}
+
+#[tokio::test]
+async fn get_server_feature_flags_returns_all_false_when_record_missing() {
+    let db = make_test_db().await;
+    let server_uuid = format!("server-{}", Uuid::new_v4());
+    let (port, commands, task) = spawn_mock_rcon_server().await;
+    ensure_server_tables(&db).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO managed_servers (name, ip, rcon_port, rcon_password, server_uuid)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(format!("feature-server-{server_uuid}"))
+    .bind("127.0.0.1")
+    .bind(i32::from(port))
+    .bind("secret")
+    .bind(&server_uuid)
+    .execute(&db)
+    .await
+    .expect("managed server fixture should insert");
+
+    let app = build_app(db.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/servers/{server_uuid}/feature-flags"))
+                .method("GET")
+                .body(Body::empty())
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: ServerFeatureFlagsResponse = read_json(response).await;
+    assert_eq!(body.server_uuid, server_uuid);
+    assert!(!body.disable_vehicle_claiming);
+    assert!(!body.force_all_vehicle_availability);
+    assert!(!body.force_all_deployable_availability);
+    assert!(!body.force_all_role_availability);
+    assert!(!body.disable_vehicle_team_requirement);
+    assert!(!body.disable_vehicle_kit_requirement);
+    assert!(!body.no_respawn_timer);
+
+    let recorded_commands = commands.lock().expect("commands lock").clone();
+    assert_eq!(recorded_commands.len(), 7);
+    assert!(recorded_commands.contains(&"AdminDisableVehicleClaiming 0".to_string()));
+    assert!(recorded_commands.contains(&"AdminNoRespawnTimer 0".to_string()));
+
+    cleanup_server_fixture(&db, &server_uuid).await;
+    task.abort();
+}
+
+#[tokio::test]
+async fn put_server_feature_flag_executes_rcon_and_persists_state() {
+    let db = make_test_db().await;
+    let server_uuid = format!("server-{}", Uuid::new_v4());
+    let (port, commands, task) = spawn_mock_rcon_server().await;
+    ensure_server_tables(&db).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO managed_servers (name, ip, rcon_port, rcon_password, server_uuid)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(format!("feature-server-{server_uuid}"))
+    .bind("127.0.0.1")
+    .bind(i32::from(port))
+    .bind("secret")
+    .bind(&server_uuid)
+    .execute(&db)
+    .await
+    .expect("managed server fixture should insert");
+
+    let app = build_app(db.clone());
+    let put_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/servers/{server_uuid}/feature-flags/disableVehicleClaiming"))
+                .method("PUT")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"enabled":true}"#))
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+
+    assert_eq!(put_response.status(), StatusCode::OK);
+    let put_body: ServerFeatureFlagsResponse = read_json(put_response).await;
+    assert!(put_body.disable_vehicle_claiming);
+
+    let get_response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/servers/{server_uuid}/feature-flags"))
+                .method("GET")
+                .body(Body::empty())
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let get_body: ServerFeatureFlagsResponse = read_json(get_response).await;
+    assert!(get_body.disable_vehicle_claiming);
+
+    let recorded_commands = commands.lock().expect("commands lock").clone();
+    assert!(recorded_commands.iter().any(|command| command == "AdminDisableVehicleClaiming 1"));
+
+    cleanup_server_fixture(&db, &server_uuid).await;
+    task.abort();
+}
+
+#[tokio::test]
+async fn get_server_feature_flags_replays_all_expected_rcon_commands() {
+    let db = make_test_db().await;
+    let server_uuid = format!("server-{}", Uuid::new_v4());
+    let (port, commands, task) = spawn_mock_rcon_server().await;
+    ensure_server_tables(&db).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO managed_servers (name, ip, rcon_port, rcon_password, server_uuid)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(format!("feature-server-{server_uuid}"))
+    .bind("127.0.0.1")
+    .bind(i32::from(port))
+    .bind("secret")
+    .bind(&server_uuid)
+    .execute(&db)
+    .await
+    .expect("managed server fixture should insert");
+
+    sqlx::query(
+        r#"
+        INSERT INTO server_feature_flags (
+            server_uuid,
+            disable_vehicle_claiming,
+            force_all_vehicle_availability,
+            force_all_deployable_availability,
+            force_all_role_availability,
+            disable_vehicle_team_requirement,
+            disable_vehicle_kit_requirement,
+            no_respawn_timer
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        "#,
+    )
+    .bind(&server_uuid)
+    .bind(true)
+    .bind(false)
+    .bind(true)
+    .bind(false)
+    .bind(true)
+    .bind(false)
+    .bind(true)
+    .execute(&db)
+    .await
+    .expect("feature flag fixture should insert");
+
+    let app = build_app(db.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/servers/{server_uuid}/feature-flags"))
+                .method("GET")
+                .body(Body::empty())
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: ServerFeatureFlagsResponse = read_json(response).await;
+    assert!(body.disable_vehicle_claiming);
+    assert!(!body.force_all_vehicle_availability);
+    assert!(body.force_all_deployable_availability);
+    assert!(!body.force_all_role_availability);
+    assert!(body.disable_vehicle_team_requirement);
+    assert!(!body.disable_vehicle_kit_requirement);
+    assert!(body.no_respawn_timer);
+
+    let recorded_commands = commands.lock().expect("commands lock").clone();
+    assert_eq!(recorded_commands.len(), 7);
+    assert!(recorded_commands.contains(&"AdminDisableVehicleClaiming 1".to_string()));
+    assert!(recorded_commands.contains(&"AdminForceAllVehicleAvailability 0".to_string()));
+    assert!(recorded_commands.contains(&"AdminForceAllDeployableAvailability 1".to_string()));
+    assert!(recorded_commands.contains(&"AdminForceAllRoleAvailability 0".to_string()));
+    assert!(recorded_commands.contains(&"AdminDisableVehicleTeamRequirement 1".to_string()));
+    assert!(recorded_commands.contains(&"AdminDisableVehicleKitRequirement 0".to_string()));
+    assert!(recorded_commands.contains(&"AdminNoRespawnTimer 1".to_string()));
+
+    cleanup_server_fixture(&db, &server_uuid).await;
+    task.abort();
 }

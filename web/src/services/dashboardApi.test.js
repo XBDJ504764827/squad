@@ -76,6 +76,8 @@ test('server-scoped workbench api methods call real backend endpoints', async ()
     await dashboardApi.getServerParseRules('server-1')
     await dashboardApi.updateServerParseRules('server-1', { rules: [] })
     await dashboardApi.getServerParsedEvents('server-1', { eventType: 'chat', limit: 50 })
+    await dashboardApi.getServerFeatureFlags('server-1')
+    await dashboardApi.updateServerFeatureFlag('server-1', 'disableVehicleClaiming', { enabled: true })
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -89,6 +91,10 @@ test('server-scoped workbench api methods call real backend endpoints', async ()
   assert.equal(calls[4][0], '/api/servers/server-1/parse-rules')
   assert.equal(calls[4][1].method, 'PUT')
   assert.equal(calls[5][0], '/api/servers/server-1/parsed-events?eventType=chat&limit=50')
+  assert.equal(calls[6][0], '/api/servers/server-1/feature-flags')
+  assert.equal(calls[7][0], '/api/servers/server-1/feature-flags/disableVehicleClaiming')
+  assert.equal(calls[7][1].method, 'PUT')
+  assert.match(calls[7][1].body, /"enabled":true/)
 })
 
 test('openServerEvents creates an EventSource against the SSE route', () => {
