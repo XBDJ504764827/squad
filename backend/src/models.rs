@@ -338,17 +338,6 @@ pub struct ManagedServerDetailResponse {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ServerAgentBindingResponse {
-    pub server_uuid: String,
-    pub agent_id: Option<String>,
-    pub agent_online: bool,
-    pub workspace_roots: Vec<WorkspaceRootSummary>,
-    pub primary_log_path: String,
-    pub last_heartbeat_at: Option<u64>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ServerAgentAuthResponse {
     pub server_uuid: String,
     pub has_key: bool,
@@ -362,24 +351,59 @@ pub struct ServerAgentAuthResponse {
     pub primary_log_path: String,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParseRuleKind {
+    Regex,
+}
+
+impl Default for ParseRuleKind {
+    fn default() -> Self {
+        Self::Regex
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UpdateServerAgentBindingRequest {
-    pub agent_id: String,
+pub struct ParseRule {
+    pub id: String,
+    #[serde(default)]
+    pub kind: ParseRuleKind,
+    pub pattern: String,
+    pub event_type: String,
+    pub severity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateServerParseRulesRequest {
+    pub rules: Vec<ParseRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerParseRulesResponse {
+    pub server_uuid: String,
+    pub version: Option<u64>,
+    pub rules: Vec<ParseRule>,
+    pub agent_online: bool,
+    pub agent_id: Option<String>,
+    pub last_heartbeat_at: Option<u64>,
+    pub applied: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OnlineAgentSummary {
     pub agent_id: String,
+    pub server_uuid: String,
     pub platform: AgentPlatform,
     pub version: String,
     pub workspace_roots: Vec<WorkspaceRootSummary>,
     pub primary_log_path: String,
     pub connected_at: u64,
     pub last_heartbeat_at: u64,
-    pub is_bound: bool,
-    pub bound_server_uuid: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -708,27 +732,6 @@ impl ManagedServerDetailResponse {
     }
 }
 
-impl ServerAgentBindingResponse {
-    pub fn from_binding(
-        server_uuid: &str,
-        binding_agent_id: Option<&str>,
-        online_agent: Option<&OnlineAgent>,
-    ) -> Self {
-        Self {
-            server_uuid: server_uuid.to_string(),
-            agent_id: binding_agent_id.map(ToOwned::to_owned),
-            agent_online: online_agent.is_some(),
-            workspace_roots: online_agent
-                .map(|agent| agent.registration.workspace_roots.clone())
-                .unwrap_or_default(),
-            primary_log_path: online_agent
-                .map(|agent| agent.registration.primary_log_path.clone())
-                .unwrap_or_default(),
-            last_heartbeat_at: online_agent.map(|agent| agent.last_heartbeat_at_ms),
-        }
-    }
-}
-
 impl ServerAgentAuthResponse {
     pub fn from_auth(
         server_uuid: &str,
@@ -752,6 +755,28 @@ impl ServerAgentAuthResponse {
             primary_log_path: online_agent
                 .map(|agent| agent.registration.primary_log_path.clone())
                 .unwrap_or_default(),
+        }
+    }
+}
+
+impl ServerParseRulesResponse {
+    pub fn from_rules(
+        server_uuid: &str,
+        version: Option<u64>,
+        rules: Vec<ParseRule>,
+        online_agent: Option<&OnlineAgent>,
+        applied: bool,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            server_uuid: server_uuid.to_string(),
+            version,
+            rules,
+            agent_online: online_agent.is_some(),
+            agent_id: online_agent.map(|agent| agent.registration.agent_id.clone()),
+            last_heartbeat_at: online_agent.map(|agent| agent.last_heartbeat_at_ms),
+            applied,
+            message: message.into(),
         }
     }
 }
@@ -872,6 +897,20 @@ pub struct FileWriteRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReplaceParseRulesRequest {
+    pub version: u64,
+    pub rules: Vec<ParseRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceParseRulesResult {
+    pub version: u64,
+    pub rule_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FileWriteRequestBody {
     pub logical_path: String,
     pub content: String,
@@ -900,6 +939,8 @@ pub enum AgentCommand {
     FileRead(FileReadRequest),
     #[serde(rename = "file.write")]
     FileWrite(FileWriteRequest),
+    #[serde(rename = "parseRules.replace")]
+    ReplaceParseRules(ReplaceParseRulesRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

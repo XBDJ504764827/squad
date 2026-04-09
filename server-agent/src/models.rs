@@ -174,6 +174,20 @@ pub struct FileWriteRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceParseRulesRequest {
+    pub version: u64,
+    pub rules: Vec<ParseRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceParseRulesResult {
+    pub version: u64,
+    pub rule_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum AgentCommand {
     #[serde(rename = "ping")]
@@ -184,6 +198,8 @@ pub enum AgentCommand {
     FileRead(FileReadRequest),
     #[serde(rename = "file.write")]
     FileWrite(FileWriteRequest),
+    #[serde(rename = "parseRules.replace")]
+    ReplaceParseRules(ReplaceParseRulesRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

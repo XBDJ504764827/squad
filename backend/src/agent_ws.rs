@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     agent_registry::AgentRegistry,
-    models::{AgentClientMessage, AgentServerMessage},
+    models::{AgentClientMessage, AgentCommand, AgentCommandEnvelope, AgentServerMessage, ReplaceParseRulesRequest},
 };
 
 pub async fn serve(mut socket: WebSocket, registry: AgentRegistry, db: PgPool) {
@@ -41,6 +41,8 @@ pub async fn serve(mut socket: WebSocket, registry: AgentRegistry, db: PgPool) {
         let _ = socket.close().await;
         return;
     }
+
+    let _ = send_initial_parse_rules(&mut socket, &db, &registration.server_uuid).await;
 
     loop {
         tokio::select! {
@@ -111,6 +113,31 @@ pub async fn serve(mut socket: WebSocket, registry: AgentRegistry, db: PgPool) {
     }
 
     registry.remove_session(&agent_id, &session_id).await;
+}
+
+async fn send_initial_parse_rules(
+    socket: &mut WebSocket,
+    db: &PgPool,
+    server_uuid: &str,
+) -> Result<(), ()> {
+    let ruleset = crate::fetch_server_parse_rules_by_server_uuid(db, server_uuid)
+        .await
+        .map_err(|_| ())?;
+    let Some(ruleset) = ruleset else {
+        return Ok(());
+    };
+
+    let payload = serde_json::to_string(&AgentServerMessage::Command(AgentCommandEnvelope {
+        request_id: format!("init-parse-rules-{server_uuid}-{}", ruleset.version),
+        command: AgentCommand::ReplaceParseRules(ReplaceParseRulesRequest {
+            version: ruleset.version as u64,
+            rules: ruleset.rules_json.0,
+        }),
+    }))
+    .map_err(|_| ())?;
+
+    socket.send(Message::Text(payload.into())).await.map_err(|_| ())?;
+    Ok(())
 }
 
 async fn read_registration(

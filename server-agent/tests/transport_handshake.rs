@@ -383,9 +383,10 @@ impl AgentCommandHandler for TestCommandHandler {
     ) -> Result<Option<Value>, server_agent::AgentError> {
         match command {
             AgentCommand::Ping => Ok(Some(json!({ "pong": true }))),
-            AgentCommand::FileTree(_) | AgentCommand::FileRead(_) | AgentCommand::FileWrite(_) => {
-                Ok(None)
-            }
+            AgentCommand::FileTree(_)
+            | AgentCommand::FileRead(_)
+            | AgentCommand::FileWrite(_)
+            | AgentCommand::ReplaceParseRules(_) => Ok(None),
         }
     }
 }

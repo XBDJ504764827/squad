@@ -17,6 +17,7 @@ use crate::models::{
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Default)]
 pub struct AgentRegistry {
@@ -75,6 +76,7 @@ impl AgentRegistry {
     }
 
     pub async fn get(&self, agent_id: &str) -> Option<OnlineAgent> {
+        self.reap_stale_sessions().await;
         self.sessions
             .read()
             .await
@@ -83,6 +85,7 @@ impl AgentRegistry {
     }
 
     pub async fn list(&self) -> Vec<OnlineAgent> {
+        self.reap_stale_sessions().await;
         self.sessions
             .read()
             .await
@@ -92,6 +95,7 @@ impl AgentRegistry {
     }
 
     pub async fn get_by_server_uuid(&self, server_uuid: &str) -> Option<OnlineAgent> {
+        self.reap_stale_sessions().await;
         self.sessions
             .read()
             .await
@@ -99,6 +103,30 @@ impl AgentRegistry {
             .map(|session| session.online_agent.clone())
             .filter(|agent| agent.registration.server_uuid == server_uuid)
             .max_by_key(|agent| agent.connected_at_ms)
+    }
+
+    pub async fn reap_stale_sessions(&self) -> usize {
+        let stale_sessions = {
+            let guard = self.sessions.read().await;
+            let now = now_millis();
+            let timeout_ms = HEARTBEAT_TIMEOUT.as_millis() as u64;
+
+            guard
+                .iter()
+                .filter_map(|(agent_id, session)| {
+                    let last_seen = session.online_agent.last_heartbeat_at_ms;
+                    let elapsed_ms = now.saturating_sub(last_seen);
+                    (elapsed_ms > timeout_ms)
+                        .then(|| (agent_id.clone(), session.online_agent.session_id.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (agent_id, session_id) in &stale_sessions {
+            self.remove_session(agent_id, session_id).await;
+        }
+
+        stale_sessions.len()
     }
 
     pub async fn record_heartbeat(&self, agent_id: &str, session_id: &str) {
@@ -259,4 +287,43 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{AgentPlatform, WorkspaceRootSummary};
+
+    #[tokio::test]
+    async fn reap_stale_sessions_removes_expired_agent() {
+        let registry = AgentRegistry::default();
+        let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel();
+        let registration = AgentRegistration {
+            server_uuid: "server-1".to_string(),
+            agent_id: "agent-1".to_string(),
+            auth_key: "key".to_string(),
+            platform: AgentPlatform::Linux,
+            version: "0.1.0".to_string(),
+            workspace_roots: vec![WorkspaceRootSummary {
+                name: "game-root".to_string(),
+                logical_path: "/game-root".to_string(),
+            }],
+            primary_log_path: "/srv/game/server.log".to_string(),
+        };
+
+        let registered = registry.register(registration, outbound_tx).await;
+        {
+            let mut guard = registry.sessions.write().await;
+            let session = guard.get_mut("agent-1").expect("session should exist");
+            session.online_agent.last_heartbeat_at_ms =
+                now_millis().saturating_sub(HEARTBEAT_TIMEOUT.as_millis() as u64 + 1);
+        }
+
+        let removed = registry.reap_stale_sessions().await;
+
+        assert_eq!(removed, 1);
+        assert!(registry.get("agent-1").await.is_none());
+        assert!(registry.get_by_server_uuid("server-1").await.is_none());
+        assert_eq!(registered.agent_id, "agent-1");
+    }
 }

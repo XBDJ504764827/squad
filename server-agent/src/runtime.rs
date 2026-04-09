@@ -7,14 +7,14 @@ use crate::file_watcher::FileWatcher;
 use crate::{
     AgentCommand, AgentCommandHandler, AgentConfig, AgentError, AgentFileChanged,
     AgentRegistration, FileReadResult, FileService, FileTreeResult, FileWriteResult, LogEnvelope,
-    LogParser, LogTailer, PathPolicy, Transport, WorkspaceRootSummary,
+    LogParser, LogTailer, ParseRule, PathPolicy, ReplaceParseRulesResult, Transport,
+    WorkspaceRootSummary,
 };
 
 pub async fn run(config: AgentConfig) -> Result<()> {
     let workspace_roots = config.workspace_roots();
     let path_policy = PathPolicy::new(&workspace_roots)?;
     let file_service = FileService::new(path_policy.clone(), config.file_service_config());
-    let _parser = LogParser::new(config.parse_rules.clone())?;
     let log_tailer = LogTailer::new(config.agent_id.clone(), "server", config.log_source.clone())?;
     let file_watcher = FileWatcher::new(path_policy, &workspace_roots)?;
 
@@ -45,7 +45,12 @@ pub async fn run(config: AgentConfig) -> Result<()> {
             .collect(),
         primary_log_path: config.log_source.primary_path.to_string_lossy().to_string(),
     };
-    let handler = RuntimeCommandHandler::with_streaming(file_service, log_tailer, file_watcher);
+    let handler = RuntimeCommandHandler::with_streaming(
+        file_service,
+        config.parse_rules.clone(),
+        log_tailer,
+        file_watcher,
+    )?;
     transport.run(registration, &handler).await?;
 
     Ok(())
@@ -53,6 +58,7 @@ pub async fn run(config: AgentConfig) -> Result<()> {
 
 pub struct RuntimeCommandHandler {
     file_service: FileService,
+    log_parser: Mutex<LogParser>,
     log_tailer: Option<Mutex<LogTailer>>,
     file_watcher: Option<Mutex<FileWatcher>>,
 }
@@ -61,21 +67,33 @@ impl RuntimeCommandHandler {
     pub fn new(file_service: FileService) -> Self {
         Self {
             file_service,
+            log_parser: Mutex::new(LogParser::new(Vec::new()).expect("empty parse rules should compile")),
             log_tailer: None,
             file_watcher: None,
         }
     }
 
+    pub fn with_parser(file_service: FileService, parse_rules: Vec<ParseRule>) -> Result<Self, AgentError> {
+        Ok(Self {
+            file_service,
+            log_parser: Mutex::new(LogParser::new(parse_rules)?),
+            log_tailer: None,
+            file_watcher: None,
+        })
+    }
+
     pub fn with_streaming(
         file_service: FileService,
+        parse_rules: Vec<ParseRule>,
         log_tailer: LogTailer,
         file_watcher: FileWatcher,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
             file_service,
+            log_parser: Mutex::new(LogParser::new(parse_rules)?),
             log_tailer: Some(Mutex::new(log_tailer)),
             file_watcher: Some(Mutex::new(file_watcher)),
-        }
+        })
     }
 }
 
@@ -116,6 +134,21 @@ impl AgentCommandHandler for RuntimeCommandHandler {
                 .map(Some)
                 .map_err(|err| {
                     AgentError::Runtime(format!("failed to serialize file write result: {err}"))
+                })
+            }
+            AgentCommand::ReplaceParseRules(request) => {
+                let mut parser = self
+                    .log_parser
+                    .lock()
+                    .map_err(|_| AgentError::Runtime("failed to lock log parser".to_string()))?;
+                parser.replace_rules(request.rules.clone())?;
+                serde_json::to_value(ReplaceParseRulesResult {
+                    version: request.version,
+                    rule_count: request.rules.len(),
+                })
+                .map(Some)
+                .map_err(|err| {
+                    AgentError::Runtime(format!("failed to serialize parse rule result: {err}"))
                 })
             }
         }

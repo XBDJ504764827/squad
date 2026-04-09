@@ -50,7 +50,7 @@ async fn make_test_db() -> sqlx::PgPool {
         .expect("test db should connect")
 }
 
-async fn ensure_binding_tables(db: &sqlx::PgPool) {
+async fn ensure_server_tables(db: &sqlx::PgPool) {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS managed_servers (
@@ -71,20 +71,6 @@ async fn ensure_binding_tables(db: &sqlx::PgPool) {
 
     sqlx::query(
         r#"
-        CREATE TABLE IF NOT EXISTS server_agent_bindings (
-            server_uuid TEXT PRIMARY KEY,
-            agent_id TEXT NOT NULL UNIQUE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        "#,
-    )
-    .execute(db)
-    .await
-    .expect("server_agent_bindings table should exist");
-
-    sqlx::query(
-        r#"
         CREATE TABLE IF NOT EXISTS server_agent_auth (
             server_uuid TEXT PRIMARY KEY,
             key_hash TEXT NOT NULL,
@@ -99,8 +85,8 @@ async fn ensure_binding_tables(db: &sqlx::PgPool) {
     .expect("server_agent_auth table should exist");
 }
 
-async fn insert_binding_fixture(db: &sqlx::PgPool, server_uuid: &str, agent_id: &str) {
-    ensure_binding_tables(db).await;
+async fn insert_server_fixture(db: &sqlx::PgPool, server_uuid: &str) {
+    ensure_server_tables(db).await;
     let rcon_port = 20000 + (server_uuid.bytes().fold(0_u16, |acc, byte| {
         acc.wrapping_add(byte as u16)
     }) % 20000);
@@ -124,29 +110,10 @@ async fn insert_binding_fixture(db: &sqlx::PgPool, server_uuid: &str, agent_id: 
     .execute(db)
     .await
     .expect("managed server fixture should insert");
-
-    sqlx::query(
-        r#"
-        INSERT INTO server_agent_bindings (server_uuid, agent_id)
-        VALUES ($1, $2)
-        ON CONFLICT (server_uuid) DO UPDATE
-        SET agent_id = EXCLUDED.agent_id,
-            updated_at = NOW()
-        "#,
-    )
-    .bind(server_uuid)
-    .bind(agent_id)
-    .execute(db)
-    .await
-    .expect("binding fixture should insert");
 }
 
-async fn cleanup_binding_fixture(db: &sqlx::PgPool, server_uuid: &str) {
+async fn cleanup_server_fixture(db: &sqlx::PgPool, server_uuid: &str) {
     let _ = sqlx::query("DELETE FROM server_agent_auth WHERE server_uuid = $1")
-        .bind(server_uuid)
-        .execute(db)
-        .await;
-    let _ = sqlx::query("DELETE FROM server_agent_bindings WHERE server_uuid = $1")
         .bind(server_uuid)
         .execute(db)
         .await;
@@ -204,7 +171,7 @@ async fn agent_websocket_route_accepts_upgrade() {
 async fn registration_is_rejected_when_server_key_is_not_provisioned() {
     let db = make_test_db().await;
     let server_uuid = format!("server-{}", Uuid::new_v4());
-    insert_binding_fixture(&db, &server_uuid, "legacy-agent").await;
+    insert_server_fixture(&db, &server_uuid).await;
 
     let registry = AgentRegistry::default();
     let app = build_app_with_registry(db.clone(), registry.clone());
@@ -242,7 +209,7 @@ async fn registration_is_rejected_when_server_key_is_not_provisioned() {
     assert!(text.contains("agent auth key is not provisioned"));
     assert!(registry.get("agent-1").await.is_none());
 
-    cleanup_binding_fixture(&db, &server_uuid).await;
+    cleanup_server_fixture(&db, &server_uuid).await;
     server.abort();
 }
 
@@ -250,7 +217,7 @@ async fn registration_is_rejected_when_server_key_is_not_provisioned() {
 async fn registration_is_rejected_when_server_key_is_invalid() {
     let db = make_test_db().await;
     let server_uuid = format!("server-{}", Uuid::new_v4());
-    insert_binding_fixture(&db, &server_uuid, "legacy-agent").await;
+    insert_server_fixture(&db, &server_uuid).await;
 
     let registry = AgentRegistry::default();
     let app = build_app_with_registry(db.clone(), registry.clone());
@@ -293,7 +260,7 @@ async fn registration_is_rejected_when_server_key_is_invalid() {
     assert!(text.contains("agent auth key is invalid"));
     assert!(registry.get("agent-1").await.is_none());
 
-    cleanup_binding_fixture(&db, &server_uuid).await;
+    cleanup_server_fixture(&db, &server_uuid).await;
     server.abort();
 }
 
@@ -301,7 +268,7 @@ async fn registration_is_rejected_when_server_key_is_invalid() {
 async fn valid_registration_marks_agent_online_and_returns_ack() {
     let db = make_test_db().await;
     let server_uuid = format!("server-{}", Uuid::new_v4());
-    insert_binding_fixture(&db, &server_uuid, "legacy-agent").await;
+    insert_server_fixture(&db, &server_uuid).await;
 
     let registry = AgentRegistry::default();
     let app = build_app_with_registry(db.clone(), registry.clone());
@@ -364,7 +331,7 @@ async fn valid_registration_marks_agent_online_and_returns_ack() {
     );
     assert_eq!(online_agent.registration.workspace_roots.len(), 1);
 
-    cleanup_binding_fixture(&db, &server_uuid).await;
+    cleanup_server_fixture(&db, &server_uuid).await;
     server.abort();
 }
 
@@ -664,10 +631,14 @@ async fn file_change_is_broadcast_to_agent_event_subscribers() {
 async fn online_agents_route_returns_binding_state_for_registered_agents() {
     let db = make_test_db().await;
     let server_uuid = format!("server-{}", Uuid::new_v4());
-    insert_binding_fixture(&db, &server_uuid, "agent-1").await;
+    let second_server_uuid = format!("server-{}", Uuid::new_v4());
+    insert_server_fixture(&db, &server_uuid).await;
+    insert_server_fixture(&db, &second_server_uuid).await;
 
     let registry = AgentRegistry::default();
     let app = build_app_with_registry(db.clone(), registry.clone());
+    let first_auth = provision_agent_auth_key(&app, &server_uuid).await;
+    let second_auth = provision_agent_auth_key(&app, &second_server_uuid).await;
     let (url, server) = spawn_app(app.clone()).await;
     let (mut socket_1, _) = connect_async(&url).await.expect("ws should connect");
     let (mut socket_2, _) = connect_async(&url).await.expect("ws should connect");
@@ -675,16 +646,16 @@ async fn online_agents_route_returns_binding_state_for_registered_agents() {
     let registration_1 = AgentClientMessage::Register(AgentRegistration {
         server_uuid: server_uuid.clone(),
         agent_id: "agent-1".to_string(),
-        auth_key: "test-auth-key".to_string(),
+        auth_key: first_auth.plain_key.expect("first plain key"),
         platform: AgentPlatform::Linux,
         version: "0.1.0".to_string(),
         workspace_roots: vec![],
         primary_log_path: "/srv/game/server.log".to_string(),
     });
     let registration_2 = AgentClientMessage::Register(AgentRegistration {
-        server_uuid: format!("server-{}", Uuid::new_v4()),
+        server_uuid: second_server_uuid.clone(),
         agent_id: "agent-2".to_string(),
-        auth_key: "test-auth-key".to_string(),
+        auth_key: second_auth.plain_key.expect("second plain key"),
         platform: AgentPlatform::Linux,
         version: "0.1.0".to_string(),
         workspace_roots: vec![],
@@ -766,21 +737,20 @@ async fn online_agents_route_returns_binding_state_for_registered_agents() {
         .find(|agent| agent.agent_id == "agent-1")
         .expect("agent-1 should exist");
     assert_eq!(agent_1.platform, AgentPlatform::Linux);
+    assert_eq!(agent_1.server_uuid, server_uuid);
     assert_eq!(agent_1.version, "0.1.0");
     assert_eq!(agent_1.primary_log_path, "/srv/game/server.log");
-    assert!(agent_1.is_bound);
-    assert_eq!(agent_1.bound_server_uuid, Some(server_uuid.clone()));
 
     let agent_2 = agents
         .iter()
         .find(|agent| agent.agent_id == "agent-2")
         .expect("agent-2 should exist");
     assert_eq!(agent_2.platform, AgentPlatform::Linux);
+    assert_eq!(agent_2.server_uuid, second_server_uuid);
     assert_eq!(agent_2.version, "0.1.0");
     assert_eq!(agent_2.primary_log_path, "/srv/game/second.log");
-    assert!(!agent_2.is_bound);
-    assert_eq!(agent_2.bound_server_uuid, None);
 
-    cleanup_binding_fixture(&db, &server_uuid).await;
+    cleanup_server_fixture(&db, &server_uuid).await;
+    cleanup_server_fixture(&db, &second_server_uuid).await;
     server.abort();
 }

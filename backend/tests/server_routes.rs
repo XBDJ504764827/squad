@@ -9,18 +9,15 @@ use axum::{
     http::{Request, StatusCode},
 };
 use backend::{
-    agent_registry::AgentRegistry,
     build_app,
-    build_app_with_registry,
     models::{
         AgentPlatform, AgentRegistration, ManagedServer, ManagedServerDetailResponse, OnlineAgent,
-        ServerAgentBindingResponse, WorkspaceRootSummary,
+        WorkspaceRootSummary,
     },
 };
 use dotenvy::from_path_override;
 use serde::{Deserialize, de::DeserializeOwned};
 use sqlx::postgres::PgPoolOptions;
-use tokio::sync::mpsc;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -60,7 +57,7 @@ async fn make_test_db() -> sqlx::PgPool {
         .expect("test db should connect")
 }
 
-async fn ensure_binding_tables(db: &sqlx::PgPool) {
+async fn ensure_server_tables(db: &sqlx::PgPool) {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS managed_servers (
@@ -78,20 +75,6 @@ async fn ensure_binding_tables(db: &sqlx::PgPool) {
     .execute(db)
     .await
     .expect("managed_servers table should exist");
-
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS server_agent_bindings (
-            server_uuid TEXT PRIMARY KEY,
-            agent_id TEXT NOT NULL UNIQUE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        "#,
-    )
-    .execute(db)
-    .await
-    .expect("server_agent_bindings table should exist");
 
     sqlx::query(
         r#"
@@ -114,7 +97,7 @@ fn next_test_rcon_port() -> i32 {
 }
 
 async fn insert_server_fixture(db: &sqlx::PgPool, server_uuid: &str) {
-    ensure_binding_tables(db).await;
+    ensure_server_tables(db).await;
 
     sqlx::query(
         r#"
@@ -137,31 +120,8 @@ async fn insert_server_fixture(db: &sqlx::PgPool, server_uuid: &str) {
     .expect("managed server fixture should insert");
 }
 
-async fn insert_binding_fixture(db: &sqlx::PgPool, server_uuid: &str, agent_id: &str) {
-    insert_server_fixture(db, server_uuid).await;
-
-    sqlx::query(
-        r#"
-        INSERT INTO server_agent_bindings (server_uuid, agent_id)
-        VALUES ($1, $2)
-        ON CONFLICT (server_uuid) DO UPDATE
-        SET agent_id = EXCLUDED.agent_id,
-            updated_at = NOW()
-        "#,
-    )
-    .bind(server_uuid)
-    .bind(agent_id)
-    .execute(db)
-    .await
-    .expect("binding fixture should insert");
-}
-
 async fn cleanup_server_fixture(db: &sqlx::PgPool, server_uuid: &str) {
     let _ = sqlx::query("DELETE FROM server_agent_auth WHERE server_uuid = $1")
-        .bind(server_uuid)
-        .execute(db)
-        .await;
-    let _ = sqlx::query("DELETE FROM server_agent_bindings WHERE server_uuid = $1")
         .bind(server_uuid)
         .execute(db)
         .await;
@@ -169,37 +129,6 @@ async fn cleanup_server_fixture(db: &sqlx::PgPool, server_uuid: &str) {
         .bind(server_uuid)
         .execute(db)
         .await;
-}
-
-async fn register_online_agent(
-    registry: &AgentRegistry,
-    server_uuid: &str,
-    agent_id: &str,
-    primary_log_path: &str,
-) -> OnlineAgent {
-    let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel();
-    registry
-        .register(
-            AgentRegistration {
-                server_uuid: server_uuid.to_string(),
-                agent_id: agent_id.to_string(),
-                auth_key: "test-auth-key".to_string(),
-                platform: AgentPlatform::Linux,
-                version: "0.1.0".to_string(),
-                workspace_roots: vec![WorkspaceRootSummary {
-                    name: "game-root".to_string(),
-                    logical_path: "/game-root".to_string(),
-                }],
-                primary_log_path: primary_log_path.to_string(),
-            },
-            outbound_tx,
-        )
-        .await;
-
-    registry
-        .get(agent_id)
-        .await
-        .expect("agent should be registered")
 }
 
 async fn read_json<T: DeserializeOwned>(response: axum::response::Response) -> T {
@@ -270,7 +199,7 @@ async fn server_delete_route_exists() {
 }
 
 #[tokio::test]
-async fn server_agent_binding_routes_exist() {
+async fn server_agent_binding_routes_are_removed() {
     let db = make_lazy_db();
     let app = build_app(db);
 
@@ -285,7 +214,7 @@ async fn server_agent_binding_routes_exist() {
         )
         .await
         .expect("response should be returned");
-    assert_ne!(get_response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(get_response.status(), StatusCode::NOT_FOUND);
 
     let put_response = app
         .clone()
@@ -299,7 +228,7 @@ async fn server_agent_binding_routes_exist() {
         )
         .await
         .expect("response should be returned");
-    assert_ne!(put_response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(put_response.status(), StatusCode::NOT_FOUND);
 
     let delete_response = app
         .oneshot(
@@ -311,7 +240,57 @@ async fn server_agent_binding_routes_exist() {
         )
         .await
         .expect("response should be returned");
-    assert_ne!(delete_response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(delete_response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn server_file_routes_exist() {
+    let db = make_lazy_db();
+    let app = build_app(db);
+
+    let tree_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/servers/test-server-uuid/files/tree?path=%2Fgame-root")
+                .method("GET")
+                .body(Body::empty())
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+    assert_ne!(tree_response.status(), StatusCode::NOT_FOUND);
+
+    let content_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/servers/test-server-uuid/files/content?path=%2Fgame-root%2Fserver.cfg")
+                .method("GET")
+                .body(Body::empty())
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+    assert_ne!(content_response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn server_event_route_exists() {
+    let db = make_lazy_db();
+    let app = build_app(db);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/servers/test-server-uuid/events")
+                .method("GET")
+                .body(Body::empty())
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+
+    assert_ne!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -343,6 +322,38 @@ async fn server_agent_auth_routes_exist() {
         .await
         .expect("response should be returned");
     assert_ne!(post_response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn server_parse_rules_routes_exist() {
+    let db = make_lazy_db();
+    let app = build_app(db);
+
+    let get_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/servers/test-server-uuid/parse-rules")
+                .method("GET")
+                .body(Body::empty())
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+    assert_ne!(get_response.status(), StatusCode::NOT_FOUND);
+
+    let put_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/servers/test-server-uuid/parse-rules")
+                .method("PUT")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"rules":[]}"#))
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+    assert_ne!(put_response.status(), StatusCode::NOT_FOUND);
 }
 
 #[test]
@@ -420,263 +431,6 @@ fn server_detail_response_keeps_binding_when_agent_is_offline() {
     assert!(!detail.agent_online);
     assert!(detail.workspace_roots.is_empty());
     assert_eq!(detail.primary_log_path, "");
-}
-
-#[test]
-fn server_agent_binding_response_includes_binding_and_online_agent_metadata() {
-    let online_agent = OnlineAgent {
-        session_id: "session-1".to_string(),
-        connected_at_ms: 1,
-        last_heartbeat_at_ms: 99,
-        registration: AgentRegistration {
-            server_uuid: "server-1".to_string(),
-            agent_id: "agent-7".to_string(),
-            auth_key: "test-auth-key".to_string(),
-            platform: AgentPlatform::Linux,
-            version: "0.1.0".to_string(),
-            workspace_roots: vec![WorkspaceRootSummary {
-                name: "game-root".to_string(),
-                logical_path: "/game-root".to_string(),
-            }],
-            primary_log_path: "/srv/game/server.log".to_string(),
-        },
-    };
-
-    let response =
-        ServerAgentBindingResponse::from_binding("server-1", Some("agent-7"), Some(&online_agent));
-
-    assert_eq!(response.server_uuid, "server-1");
-    assert_eq!(response.agent_id, Some("agent-7".to_string()));
-    assert!(response.agent_online);
-    assert_eq!(response.workspace_roots.len(), 1);
-    assert_eq!(response.primary_log_path, "/srv/game/server.log");
-    assert_eq!(response.last_heartbeat_at, Some(99));
-}
-
-#[tokio::test]
-async fn binding_routes_return_404_when_server_is_missing() {
-    let db = make_test_db().await;
-    ensure_binding_tables(&db).await;
-    let app = build_app(db);
-    let missing_server_uuid = format!("missing-{}", Uuid::new_v4());
-
-    let get_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!(
-                    "/api/servers/{missing_server_uuid}/agent-binding"
-                ))
-                .method("GET")
-                .body(Body::empty())
-                .expect("request should be built"),
-        )
-        .await
-        .expect("response should be returned");
-    assert_eq!(get_response.status(), StatusCode::NOT_FOUND);
-
-    let put_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!(
-                    "/api/servers/{missing_server_uuid}/agent-binding"
-                ))
-                .method("PUT")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"agentId":"agent-missing"}"#))
-                .expect("request should be built"),
-        )
-        .await
-        .expect("response should be returned");
-    assert_eq!(put_response.status(), StatusCode::NOT_FOUND);
-
-    let delete_response = app
-        .oneshot(
-            Request::builder()
-                .uri(format!(
-                    "/api/servers/{missing_server_uuid}/agent-binding"
-                ))
-                .method("DELETE")
-                .body(Body::empty())
-                .expect("request should be built"),
-        )
-        .await
-        .expect("response should be returned");
-    assert_eq!(delete_response.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn put_server_agent_binding_rejects_empty_agent_id() {
-    let db = make_test_db().await;
-    let server_uuid = format!("server-{}", Uuid::new_v4());
-    insert_server_fixture(&db, &server_uuid).await;
-    let app = build_app(db.clone());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/servers/{server_uuid}/agent-binding"))
-                .method("PUT")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"agentId":"   "}"#))
-                .expect("request should be built"),
-        )
-        .await
-        .expect("response should be returned");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-    cleanup_server_fixture(&db, &server_uuid).await;
-}
-
-#[tokio::test]
-async fn put_server_agent_binding_persists_binding_and_reads_online_state() {
-    let db = make_test_db().await;
-    let server_uuid = format!("server-{}", Uuid::new_v4());
-    insert_server_fixture(&db, &server_uuid).await;
-
-    let registry = AgentRegistry::default();
-    let online_agent = register_online_agent(
-        &registry,
-        &server_uuid,
-        "agent-online",
-        "/srv/game/server.log",
-    )
-    .await;
-    let app = build_app_with_registry(db.clone(), registry);
-
-    let put_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/servers/{server_uuid}/agent-binding"))
-                .method("PUT")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"agentId":"agent-online"}"#))
-                .expect("request should be built"),
-        )
-        .await
-        .expect("response should be returned");
-    assert_eq!(put_response.status(), StatusCode::OK);
-    let put_body: ServerAgentBindingResponse = read_json(put_response).await;
-    assert_eq!(put_body.agent_id, Some("agent-online".to_string()));
-    assert!(put_body.agent_online);
-    assert_eq!(put_body.workspace_roots, online_agent.registration.workspace_roots);
-    assert_eq!(put_body.primary_log_path, "/srv/game/server.log");
-    assert_eq!(
-        put_body.last_heartbeat_at,
-        Some(online_agent.last_heartbeat_at_ms)
-    );
-
-    let get_binding_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/servers/{server_uuid}/agent-binding"))
-                .method("GET")
-                .body(Body::empty())
-                .expect("request should be built"),
-        )
-        .await
-        .expect("response should be returned");
-    assert_eq!(get_binding_response.status(), StatusCode::OK);
-    let binding_body: ServerAgentBindingResponse = read_json(get_binding_response).await;
-    assert_eq!(binding_body.agent_id, Some("agent-online".to_string()));
-    assert!(binding_body.agent_online);
-
-    cleanup_server_fixture(&db, &server_uuid).await;
-}
-
-#[tokio::test]
-async fn put_server_agent_binding_rejects_agent_already_bound_to_other_server() {
-    let db = make_test_db().await;
-    let first_server_uuid = format!("server-{}", Uuid::new_v4());
-    let second_server_uuid = format!("server-{}", Uuid::new_v4());
-    insert_server_fixture(&db, &first_server_uuid).await;
-    insert_server_fixture(&db, &second_server_uuid).await;
-    let app = build_app(db.clone());
-
-    let first_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/servers/{first_server_uuid}/agent-binding"))
-                .method("PUT")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"agentId":"agent-conflict"}"#))
-                .expect("request should be built"),
-        )
-        .await
-        .expect("response should be returned");
-    assert_eq!(first_response.status(), StatusCode::OK);
-
-    let second_response = app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/servers/{second_server_uuid}/agent-binding"))
-                .method("PUT")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"agentId":"agent-conflict"}"#))
-                .expect("request should be built"),
-        )
-        .await
-        .expect("response should be returned");
-    assert_eq!(second_response.status(), StatusCode::CONFLICT);
-
-    cleanup_server_fixture(&db, &first_server_uuid).await;
-    cleanup_server_fixture(&db, &second_server_uuid).await;
-}
-
-#[tokio::test]
-async fn delete_server_agent_binding_is_idempotent() {
-    let db = make_test_db().await;
-    let server_uuid = format!("server-{}", Uuid::new_v4());
-    insert_binding_fixture(&db, &server_uuid, "agent-to-delete").await;
-    let app = build_app(db.clone());
-
-    let first_delete_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/servers/{server_uuid}/agent-binding"))
-                .method("DELETE")
-                .body(Body::empty())
-                .expect("request should be built"),
-        )
-        .await
-        .expect("response should be returned");
-    assert_eq!(first_delete_response.status(), StatusCode::OK);
-
-    let second_delete_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/servers/{server_uuid}/agent-binding"))
-                .method("DELETE")
-                .body(Body::empty())
-                .expect("request should be built"),
-        )
-        .await
-        .expect("response should be returned");
-    assert_eq!(second_delete_response.status(), StatusCode::OK);
-
-    let get_response = app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/servers/{server_uuid}/agent-binding"))
-                .method("GET")
-                .body(Body::empty())
-                .expect("request should be built"),
-        )
-        .await
-        .expect("response should be returned");
-    assert_eq!(get_response.status(), StatusCode::OK);
-    let body: ServerAgentBindingResponse = read_json(get_response).await;
-    assert_eq!(body.agent_id, None);
-    assert!(!body.agent_online);
-
-    cleanup_server_fixture(&db, &server_uuid).await;
 }
 
 #[tokio::test]

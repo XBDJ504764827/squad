@@ -19,15 +19,16 @@ use dotenvy::from_path_override;
 use futures::stream;
 use models::{
     ActionResponse, AddServerRequest, AgentCommand, AgentStreamEvent, DashboardResponse,
-    ErrorResponse, FilePathQuery, FileReadRequest, FileReadResult, FileTreeRequest, FileTreeResult,
-    FileWriteRequest, FileWriteRequestBody, FileWriteResult, HealthResponse, ManagedServer,
-    ManagedServerDetailResponse, OnlineAgentSummary, ServerAgentAuthResponse,
-    ServerAgentBindingResponse,
-    UpdateServerAgentBindingRequest, UpdateServerRequest,
+    ErrorResponse, FilePathQuery, FileReadRequest, FileReadResult, FileTreeRequest,
+    FileTreeResult, FileWriteRequest, FileWriteRequestBody, FileWriteResult, HealthResponse,
+    ManagedServer, ManagedServerDetailResponse, OnlineAgent, OnlineAgentSummary, ParseRule,
+    ParseRuleKind, ReplaceParseRulesRequest, ServerAgentAuthResponse, ServerParseRulesResponse,
+    UpdateServerParseRulesRequest, UpdateServerRequest,
 };
+use regex::Regex;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
+use sqlx::{FromRow, PgPool, postgres::PgPoolOptions, types::Json as SqlxJson};
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
@@ -80,6 +81,16 @@ pub fn build_app(db: PgPool) -> Router {
 }
 
 pub fn build_app_with_registry(db: PgPool, agent_registry: AgentRegistry) -> Router {
+    let reaper_registry = agent_registry.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let _ = reaper_registry.reap_stale_sessions().await;
+        }
+    });
+
     Router::new()
         .route("/api/health", get(health))
         .route("/api/dashboard", get(dashboard))
@@ -87,6 +98,7 @@ pub fn build_app_with_registry(db: PgPool, agent_registry: AgentRegistry) -> Rou
         .route("/api/agents/online", get(list_online_agents))
         .route("/api/agents/connect", get(connect_agent_ws))
         .route("/api/agents/{agent_id}/events", get(stream_agent_events))
+        .route("/api/servers/{server_uuid}/events", get(stream_server_events))
         .route(
             "/api/agents/{agent_id}/files/tree",
             get(get_agent_file_tree),
@@ -96,19 +108,25 @@ pub fn build_app_with_registry(db: PgPool, agent_registry: AgentRegistry) -> Rou
             get(get_agent_file_content).put(put_agent_file_content),
         )
         .route(
-            "/api/servers/{server_uuid}",
-            get(get_server).put(update_server).delete(delete_server),
+            "/api/servers/{server_uuid}/files/tree",
+            get(get_server_file_tree),
         )
         .route(
-            "/api/servers/{server_uuid}/agent-binding",
-            get(get_server_agent_binding)
-                .put(put_server_agent_binding)
-                .delete(delete_server_agent_binding),
+            "/api/servers/{server_uuid}/files/content",
+            get(get_server_file_content).put(put_server_file_content),
+        )
+        .route(
+            "/api/servers/{server_uuid}",
+            get(get_server).put(update_server).delete(delete_server),
         )
         .route("/api/servers/{server_uuid}/agent-auth", get(get_server_agent_auth))
         .route(
             "/api/servers/{server_uuid}/agent-auth-key",
             post(post_server_agent_auth_key),
+        )
+        .route(
+            "/api/servers/{server_uuid}/parse-rules",
+            get(get_server_parse_rules).put(put_server_parse_rules),
         )
         .with_state(AppState { db, agent_registry })
         .layer(
@@ -130,7 +148,27 @@ async fn stream_agent_events(
     AxumPath(agent_id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    let receiver = state.agent_registry.subscribe_events(&agent_id).await;
+    stream_events_for_agent(state.agent_registry.clone(), agent_id).await
+}
+
+async fn stream_server_events(
+    AxumPath(server_uuid): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ErrorResponse>)>
+{
+    let online_agent = require_online_agent_for_server(&state, &server_uuid).await?;
+    Ok(stream_events_for_agent(
+        state.agent_registry.clone(),
+        online_agent.registration.agent_id.clone(),
+    )
+    .await)
+}
+
+async fn stream_events_for_agent(
+    registry: AgentRegistry,
+    agent_id: String,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let receiver = registry.subscribe_events(&agent_id).await;
 
     let stream = stream::unfold(receiver, |mut receiver| async move {
         let next_event = match receiver.recv().await {
@@ -208,6 +246,62 @@ async fn put_agent_file_content(
     Ok(Json(result))
 }
 
+async fn get_server_file_tree(
+    AxumPath(server_uuid): AxumPath<String>,
+    Query(query): Query<FilePathQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<FileTreeResult>, (StatusCode, Json<ErrorResponse>)> {
+    let online_agent = require_online_agent_for_server(&state, &server_uuid).await?;
+    let result = dispatch_agent_command::<FileTreeResult>(
+        &state.agent_registry,
+        &online_agent.registration.agent_id,
+        AgentCommand::FileTree(FileTreeRequest {
+            logical_path: query.path,
+        }),
+    )
+    .await?;
+
+    Ok(Json(result))
+}
+
+async fn get_server_file_content(
+    AxumPath(server_uuid): AxumPath<String>,
+    Query(query): Query<FilePathQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<FileReadResult>, (StatusCode, Json<ErrorResponse>)> {
+    let online_agent = require_online_agent_for_server(&state, &server_uuid).await?;
+    let result = dispatch_agent_command::<FileReadResult>(
+        &state.agent_registry,
+        &online_agent.registration.agent_id,
+        AgentCommand::FileRead(FileReadRequest {
+            logical_path: query.path,
+        }),
+    )
+    .await?;
+
+    Ok(Json(result))
+}
+
+async fn put_server_file_content(
+    AxumPath(server_uuid): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<FileWriteRequestBody>,
+) -> Result<Json<FileWriteResult>, (StatusCode, Json<ErrorResponse>)> {
+    let online_agent = require_online_agent_for_server(&state, &server_uuid).await?;
+    let result = dispatch_agent_command::<FileWriteResult>(
+        &state.agent_registry,
+        &online_agent.registration.agent_id,
+        AgentCommand::FileWrite(FileWriteRequest {
+            logical_path: payload.logical_path,
+            content: payload.content,
+            expected_version: payload.expected_version,
+        }),
+    )
+    .await?;
+
+    Ok(Json(result))
+}
+
 impl AppConfig {
     fn from_env() -> Self {
         Self {
@@ -256,14 +350,13 @@ async fn list_online_agents(
         .map(|agent| {
             OnlineAgentSummary {
                 agent_id: agent.registration.agent_id.clone(),
+                server_uuid: agent.registration.server_uuid.clone(),
                 platform: agent.registration.platform.clone(),
                 version: agent.registration.version.clone(),
                 workspace_roots: agent.registration.workspace_roots.clone(),
                 primary_log_path: agent.registration.primary_log_path.clone(),
                 connected_at: agent.connected_at_ms,
                 last_heartbeat_at: agent.last_heartbeat_at_ms,
-                is_bound: !agent.registration.server_uuid.is_empty(),
-                bound_server_uuid: Some(agent.registration.server_uuid.clone()),
             }
         })
         .collect::<Vec<_>>();
@@ -289,32 +382,6 @@ async fn get_server(
         online_agent
             .as_ref()
             .map(|agent| agent.registration.agent_id.as_str()),
-        online_agent.as_ref(),
-    )))
-}
-
-async fn get_server_agent_binding(
-    AxumPath(server_uuid): AxumPath<String>,
-    State(state): State<AppState>,
-) -> Result<Json<ServerAgentBindingResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if !server_exists(&state.db, &server_uuid)
-        .await
-        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器失败"))?
-    {
-        return Err(error_response(StatusCode::NOT_FOUND, "服务器不存在"));
-    }
-
-    let binding = fetch_server_agent_binding_by_server_uuid(&state.db, &server_uuid)
-        .await
-        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取绑定关系失败"))?;
-    let online_agent = match binding.as_ref() {
-        Some(binding) => state.agent_registry.get(&binding.agent_id).await,
-        None => None,
-    };
-
-    Ok(Json(ServerAgentBindingResponse::from_binding(
-        &server_uuid,
-        binding.as_ref().map(|binding| binding.agent_id.as_str()),
         online_agent.as_ref(),
     )))
 }
@@ -412,6 +479,97 @@ async fn post_server_agent_auth_key(
     )))
 }
 
+async fn get_server_parse_rules(
+    AxumPath(server_uuid): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<ServerParseRulesResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !server_exists(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器失败"))?
+    {
+        return Err(error_response(StatusCode::NOT_FOUND, "服务器不存在"));
+    }
+
+    let ruleset = fetch_server_parse_rules_by_server_uuid(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取解析规则失败"))?;
+    let online_agent = state.agent_registry.get_by_server_uuid(&server_uuid).await;
+
+    Ok(Json(ServerParseRulesResponse::from_rules(
+        &server_uuid,
+        ruleset.as_ref().map(|record| record.version as u64),
+        ruleset.map(|record| record.rules_json.0).unwrap_or_default(),
+        online_agent.as_ref(),
+        false,
+        "解析规则已读取",
+    )))
+}
+
+async fn put_server_parse_rules(
+    AxumPath(server_uuid): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<UpdateServerParseRulesRequest>,
+) -> Result<Json<ServerParseRulesResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !server_exists(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器失败"))?
+    {
+        return Err(error_response(StatusCode::NOT_FOUND, "服务器不存在"));
+    }
+
+    validate_parse_rules(&payload.rules)
+        .map_err(|message| error_response(StatusCode::BAD_REQUEST, &message))?;
+
+    let existing_ruleset = fetch_server_parse_rules_by_server_uuid(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取解析规则失败"))?;
+    let next_version = existing_ruleset
+        .as_ref()
+        .map(|record| record.version as u64 + 1)
+        .unwrap_or(1);
+
+    upsert_server_parse_rules(&state.db, &server_uuid, next_version, &payload.rules)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "写入解析规则失败"))?;
+
+    let online_agent = state.agent_registry.get_by_server_uuid(&server_uuid).await;
+    let (applied, message) = if let Some(agent) = online_agent.as_ref() {
+        match dispatch_agent_command::<serde_json::Value>(
+            &state.agent_registry,
+            &agent.registration.agent_id,
+            AgentCommand::ReplaceParseRules(ReplaceParseRulesRequest {
+                version: next_version,
+                rules: payload.rules.clone(),
+            }),
+        )
+        .await
+        {
+            Ok(_) => (true, "解析规则已保存并下发到在线 Agent".to_string()),
+            Err((status, error)) => {
+                if status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::CONFLICT {
+                    (false, "解析规则已保存，当前 Agent 不在线".to_string())
+                } else {
+                    (
+                        false,
+                        format!("解析规则已保存，但热更新下发失败：{}", error.message),
+                    )
+                }
+            }
+        }
+    } else {
+        (false, "解析规则已保存，等待 Agent 下次连接时同步".to_string())
+    };
+
+    Ok(Json(ServerParseRulesResponse::from_rules(
+        &server_uuid,
+        Some(next_version),
+        payload.rules,
+        online_agent.as_ref(),
+        applied,
+        message,
+    )))
+}
+
 async fn update_server(
     AxumPath(server_uuid): AxumPath<String>,
     State(state): State<AppState>,
@@ -491,70 +649,6 @@ async fn delete_server(
     }))
 }
 
-async fn put_server_agent_binding(
-    AxumPath(server_uuid): AxumPath<String>,
-    State(state): State<AppState>,
-    Json(payload): Json<UpdateServerAgentBindingRequest>,
-) -> Result<Json<ServerAgentBindingResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if !server_exists(&state.db, &server_uuid)
-        .await
-        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器失败"))?
-    {
-        return Err(error_response(StatusCode::NOT_FOUND, "服务器不存在"));
-    }
-
-    let agent_id = payload.agent_id.trim().to_string();
-    if agent_id.is_empty() {
-        return Err(error_response(StatusCode::BAD_REQUEST, "agentId 不能为空"));
-    }
-
-    let existing_binding = fetch_server_agent_binding_by_agent_id(&state.db, &agent_id)
-        .await
-        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取绑定关系失败"))?;
-    if let Some(existing_binding) = existing_binding {
-        if existing_binding.server_uuid != server_uuid {
-            return Err(error_response(
-                StatusCode::CONFLICT,
-                "agent 已绑定到其他服务器",
-            ));
-        }
-    }
-
-    upsert_server_agent_binding(&state.db, &server_uuid, &agent_id)
-        .await
-        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "写入绑定关系失败"))?;
-
-    let online_agent = state.agent_registry.get(&agent_id).await;
-
-    Ok(Json(ServerAgentBindingResponse::from_binding(
-        &server_uuid,
-        Some(&agent_id),
-        online_agent.as_ref(),
-    )))
-}
-
-async fn delete_server_agent_binding(
-    AxumPath(server_uuid): AxumPath<String>,
-    State(state): State<AppState>,
-) -> Result<Json<ServerAgentBindingResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if !server_exists(&state.db, &server_uuid)
-        .await
-        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器失败"))?
-    {
-        return Err(error_response(StatusCode::NOT_FOUND, "服务器不存在"));
-    }
-
-    delete_server_agent_binding_record(&state.db, &server_uuid)
-        .await
-        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "删除绑定关系失败"))?;
-
-    Ok(Json(ServerAgentBindingResponse::from_binding(
-        &server_uuid,
-        None,
-        None,
-    )))
-}
-
 async fn dispatch_agent_command<T>(
     registry: &AgentRegistry,
     agent_id: &str,
@@ -588,6 +682,47 @@ where
             &format!("agent returned invalid payload: {err}"),
         )
     })
+}
+
+async fn require_online_agent_for_server(
+    state: &AppState,
+    server_uuid: &str,
+) -> Result<OnlineAgent, (StatusCode, Json<ErrorResponse>)> {
+    if !server_exists(&state.db, server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器失败"))?
+    {
+        return Err(error_response(StatusCode::NOT_FOUND, "服务器不存在"));
+    }
+
+    state
+        .agent_registry
+        .get_by_server_uuid(server_uuid)
+        .await
+        .ok_or_else(|| error_response(StatusCode::SERVICE_UNAVAILABLE, "agent 不在线"))
+}
+
+fn validate_parse_rules(rules: &[ParseRule]) -> Result<(), String> {
+    for rule in rules {
+        if rule.id.trim().is_empty() {
+            return Err("parse rule id is required".to_string());
+        }
+        if rule.event_type.trim().is_empty() {
+            return Err(format!("parse rule `{}` eventType is required", rule.id));
+        }
+        if rule.severity.trim().is_empty() {
+            return Err(format!("parse rule `{}` severity is required", rule.id));
+        }
+
+        match rule.kind {
+            ParseRuleKind::Regex => {
+                Regex::new(&rule.pattern)
+                    .map_err(|err| format!("invalid parse rule `{}`: {err}", rule.id))?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_server_payload(
@@ -695,53 +830,6 @@ async fn initialize_database(db: &PgPool) -> Result<(), sqlx::Error> {
 
     sqlx::query(
         r#"
-        CREATE TABLE IF NOT EXISTS server_agent_bindings (
-            server_uuid TEXT PRIMARY KEY,
-            agent_id TEXT NOT NULL UNIQUE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        "#,
-    )
-    .execute(db)
-    .await?;
-
-    sqlx::query(
-        r#"
-        DELETE FROM server_agent_bindings
-        WHERE server_uuid NOT IN (
-            SELECT server_uuid
-            FROM managed_servers
-        )
-        "#,
-    )
-    .execute(db)
-    .await?;
-
-    sqlx::query(
-        r#"
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1
-                FROM pg_constraint
-                WHERE conname = 'server_agent_bindings_server_uuid_fkey'
-                  AND conrelid = 'server_agent_bindings'::regclass
-            ) THEN
-                ALTER TABLE server_agent_bindings
-                ADD CONSTRAINT server_agent_bindings_server_uuid_fkey
-                FOREIGN KEY (server_uuid)
-                REFERENCES managed_servers (server_uuid)
-                ON DELETE CASCADE;
-            END IF;
-        END $$;
-        "#,
-    )
-    .execute(db)
-    .await?;
-
-    sqlx::query(
-        r#"
         CREATE TABLE IF NOT EXISTS server_agent_auth (
             server_uuid TEXT PRIMARY KEY,
             key_hash TEXT NOT NULL,
@@ -788,6 +876,54 @@ async fn initialize_database(db: &PgPool) -> Result<(), sqlx::Error> {
     .execute(db)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS server_parse_rules (
+            server_uuid TEXT PRIMARY KEY,
+            rules_json JSONB NOT NULL,
+            version BIGINT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM server_parse_rules
+        WHERE server_uuid NOT IN (
+            SELECT server_uuid
+            FROM managed_servers
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname = 'server_parse_rules_server_uuid_fkey'
+                  AND conrelid = 'server_parse_rules'::regclass
+            ) THEN
+                ALTER TABLE server_parse_rules
+                ADD CONSTRAINT server_parse_rules_server_uuid_fkey
+                FOREIGN KEY (server_uuid)
+                REFERENCES managed_servers (server_uuid)
+                ON DELETE CASCADE;
+            END IF;
+        END $$;
+        "#,
+    )
+    .execute(db)
+    .await?;
+
     Ok(())
 }
 
@@ -806,17 +942,18 @@ async fn fetch_servers(db: &PgPool) -> Result<Vec<ManagedServer>, sqlx::Error> {
 }
 
 #[derive(Clone, FromRow)]
-struct ServerAgentBindingRecord {
-    server_uuid: String,
-    agent_id: String,
-}
-
-#[derive(Clone, FromRow)]
 struct ServerAgentAuthRecord {
     _server_uuid: String,
     key_hash: String,
     key_preview: String,
     rotated_at_ms: i64,
+}
+
+#[derive(Clone, FromRow)]
+pub(crate) struct ServerParseRulesRecord {
+    _server_uuid: String,
+    rules_json: SqlxJson<Vec<ParseRule>>,
+    version: i64,
 }
 
 async fn fetch_server_agent_auth_by_server_uuid(
@@ -839,14 +976,17 @@ async fn fetch_server_agent_auth_by_server_uuid(
     .await
 }
 
-async fn fetch_server_agent_binding_by_server_uuid(
+pub(crate) async fn fetch_server_parse_rules_by_server_uuid(
     db: &PgPool,
     server_uuid: &str,
-) -> Result<Option<ServerAgentBindingRecord>, sqlx::Error> {
-    sqlx::query_as::<_, ServerAgentBindingRecord>(
+) -> Result<Option<ServerParseRulesRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ServerParseRulesRecord>(
         r#"
-        SELECT server_uuid, agent_id
-        FROM server_agent_bindings
+        SELECT
+            server_uuid AS _server_uuid,
+            rules_json,
+            version
+        FROM server_parse_rules
         WHERE server_uuid = $1
         "#,
     )
@@ -855,55 +995,25 @@ async fn fetch_server_agent_binding_by_server_uuid(
     .await
 }
 
-async fn fetch_server_agent_binding_by_agent_id(
-    db: &PgPool,
-    agent_id: &str,
-) -> Result<Option<ServerAgentBindingRecord>, sqlx::Error> {
-    sqlx::query_as::<_, ServerAgentBindingRecord>(
-        r#"
-        SELECT server_uuid, agent_id
-        FROM server_agent_bindings
-        WHERE agent_id = $1
-        "#,
-    )
-    .bind(agent_id)
-    .fetch_optional(db)
-    .await
-}
-
-async fn upsert_server_agent_binding(
+async fn upsert_server_parse_rules(
     db: &PgPool,
     server_uuid: &str,
-    agent_id: &str,
+    version: u64,
+    rules: &[ParseRule],
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
-        INSERT INTO server_agent_bindings (server_uuid, agent_id)
-        VALUES ($1, $2)
+        INSERT INTO server_parse_rules (server_uuid, rules_json, version)
+        VALUES ($1, $2, $3)
         ON CONFLICT (server_uuid) DO UPDATE
-        SET agent_id = EXCLUDED.agent_id,
+        SET rules_json = EXCLUDED.rules_json,
+            version = EXCLUDED.version,
             updated_at = NOW()
         "#,
     )
     .bind(server_uuid)
-    .bind(agent_id)
-    .execute(db)
-    .await?;
-
-    Ok(())
-}
-
-async fn delete_server_agent_binding_record(
-    db: &PgPool,
-    server_uuid: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        DELETE FROM server_agent_bindings
-        WHERE server_uuid = $1
-        "#,
-    )
-    .bind(server_uuid)
+    .bind(SqlxJson(rules.to_vec()))
+    .bind(version as i64)
     .execute(db)
     .await?;
 
@@ -966,9 +1076,10 @@ pub(crate) async fn verify_agent_registration_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{ParseRule, ParseRuleKind};
 
     #[tokio::test]
-    async fn initialize_database_creates_server_agent_bindings_table_and_fk() {
+    async fn initialize_database_does_not_create_server_agent_bindings_table() {
         let env_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
         from_path_override(&env_path).ok();
 
@@ -990,21 +1101,7 @@ mod tests {
         .await
         .expect("failed to query server_agent_bindings table");
 
-        assert!(table_exists.is_some());
-
-        let constraint_count = sqlx::query_scalar::<_, i64>(
-            r#"
-            SELECT COUNT(*)
-            FROM pg_constraint
-            WHERE conname = 'server_agent_bindings_server_uuid_fkey'
-              AND conrelid = 'server_agent_bindings'::regclass
-            "#,
-        )
-        .fetch_one(&db)
-        .await
-        .expect("failed to query server_agent_bindings foreign key");
-
-        assert!(constraint_count > 0);
+        assert_eq!(table_exists, None);
     }
 
     #[tokio::test]
@@ -1097,6 +1194,19 @@ mod tests {
         .expect("failed to query orphan auth row");
 
         assert_eq!(orphan_count, 0);
+    }
+
+    #[test]
+    fn validate_parse_rules_rejects_invalid_regex() {
+        let result = validate_parse_rules(&[ParseRule {
+            id: "broken".to_string(),
+            kind: ParseRuleKind::Regex,
+            pattern: "(".to_string(),
+            event_type: "chat".to_string(),
+            severity: "info".to_string(),
+        }]);
+
+        assert!(result.is_err());
     }
 }
 

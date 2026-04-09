@@ -5,7 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use server_agent::{
     runtime::RuntimeCommandHandler, AgentCommand, AgentCommandHandler, FileReadRequest,
     FileReadResult, FileService, FileServiceConfig, FileTreeEntry, FileTreeRequest, FileTreeResult,
-    FileWriteRequest, FileWriteResult, PathPolicy, WorkspaceRootConfig,
+    FileWriteRequest, FileWriteResult, ParseRule, ParseRuleKind, PathPolicy,
+    ReplaceParseRulesRequest, ReplaceParseRulesResult, WorkspaceRootConfig,
 };
 
 fn make_temp_dir(prefix: &str) -> PathBuf {
@@ -31,6 +32,16 @@ fn build_service(root_name: &str, root_path: PathBuf) -> FileService {
             allowed_extensions: Some(vec![".txt".to_string(), ".cfg".to_string()]),
         },
     )
+}
+
+fn make_rule(id: &str, pattern: &str, event_type: &str, severity: &str) -> ParseRule {
+    ParseRule {
+        id: id.to_string(),
+        kind: ParseRuleKind::Regex,
+        pattern: pattern.to_string(),
+        event_type: event_type.to_string(),
+        severity: severity.to_string(),
+    }
 }
 
 #[test]
@@ -118,4 +129,59 @@ fn file_write_command_updates_file_and_returns_new_version() {
         fs::read_to_string(&file_path).expect("read file"),
         "hostname=new\n"
     );
+}
+
+#[test]
+fn replace_parse_rules_command_updates_runtime_parser() {
+    let tmp = make_temp_dir("runtime-rules");
+    let workspace_root = tmp.join("workspace");
+    fs::create_dir_all(&workspace_root).expect("mkdir");
+
+    let handler = RuntimeCommandHandler::with_parser(
+        build_service("workspace", workspace_root),
+        vec![make_rule(
+            "chat",
+            r"^\[CHAT\] (?P<player>[^:]+): (?P<message>.+)$",
+            "chat",
+            "info",
+        )],
+    )
+    .expect("handler should build");
+
+    let payload = handler
+        .handle_command(AgentCommand::ReplaceParseRules(ReplaceParseRulesRequest {
+            version: 2,
+            rules: vec![make_rule("kill", r"^\[KILL\] (?P<killer>.+)$", "kill", "warn")],
+        }))
+        .expect("command should succeed")
+        .expect("payload should exist");
+    let result: ReplaceParseRulesResult = serde_json::from_value(payload).expect("payload json");
+
+    assert_eq!(result.version, 2);
+    assert_eq!(result.rule_count, 1);
+}
+
+#[test]
+fn invalid_replace_parse_rules_keeps_previous_rules_active() {
+    let tmp = make_temp_dir("runtime-rules-invalid");
+    let workspace_root = tmp.join("workspace");
+    fs::create_dir_all(&workspace_root).expect("mkdir");
+
+    let handler = RuntimeCommandHandler::with_parser(
+        build_service("workspace", workspace_root),
+        vec![make_rule(
+            "chat",
+            r"^\[CHAT\] (?P<player>[^:]+): (?P<message>.+)$",
+            "chat",
+            "info",
+        )],
+    )
+    .expect("handler should build");
+
+    let result = handler.handle_command(AgentCommand::ReplaceParseRules(ReplaceParseRulesRequest {
+        version: 2,
+        rules: vec![make_rule("broken", "(", "chat", "info")],
+    }));
+
+    assert!(result.is_err());
 }
