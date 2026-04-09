@@ -703,9 +703,72 @@ pub struct AgentRegistered {
 pub struct AgentHeartbeat {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+pub struct FileTreeEntry {
+    pub logical_path: String,
+    pub is_dir: bool,
+    pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTreeResult {
+    pub entries: Vec<FileTreeEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileReadRequest {
+    pub logical_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileReadResult {
+    pub logical_path: String,
+    pub content: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTreeRequest {
+    pub logical_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileWriteRequest {
+    pub logical_path: String,
+    pub content: String,
+    pub expected_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileWriteRequestBody {
+    pub logical_path: String,
+    pub content: String,
+    pub expected_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileWriteResult {
+    pub logical_path: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilePathQuery {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
 pub enum AgentCommand {
+    #[serde(rename = "ping")]
     Ping,
+    #[serde(rename = "file.tree")]
+    FileTree(FileTreeRequest),
+    #[serde(rename = "file.read")]
+    FileRead(FileReadRequest),
+    #[serde(rename = "file.write")]
+    FileWrite(FileWriteRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

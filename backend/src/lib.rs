@@ -7,16 +7,19 @@ use std::{env, net::SocketAddr, path::Path};
 
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, State, WebSocketUpgrade},
+    extract::{Path as AxumPath, Query, State, WebSocketUpgrade},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
 };
 use dotenvy::from_path_override;
 use models::{
-    ActionResponse, AddServerRequest, DashboardResponse, ErrorResponse, HealthResponse,
-    ManagedServer, ManagedServerDetailResponse, UpdateServerRequest,
+    ActionResponse, AddServerRequest, AgentCommand, DashboardResponse, ErrorResponse,
+    FilePathQuery, FileReadRequest, FileReadResult, FileTreeRequest, FileTreeResult,
+    FileWriteRequest, FileWriteRequestBody, FileWriteResult, HealthResponse, ManagedServer,
+    ManagedServerDetailResponse, UpdateServerRequest,
 };
+use serde::de::DeserializeOwned;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
@@ -76,6 +79,14 @@ pub fn build_app_with_registry(db: PgPool, agent_registry: AgentRegistry) -> Rou
         .route("/api/servers", post(add_server))
         .route("/api/agents/connect", get(connect_agent_ws))
         .route(
+            "/api/agents/{agent_id}/files/tree",
+            get(get_agent_file_tree),
+        )
+        .route(
+            "/api/agents/{agent_id}/files/content",
+            get(get_agent_file_content).put(put_agent_file_content),
+        )
+        .route(
             "/api/servers/{server_uuid}",
             get(get_server).put(update_server).delete(delete_server),
         )
@@ -93,6 +104,59 @@ async fn connect_agent_ws(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| agent_ws::serve(socket, state.agent_registry))
+}
+
+async fn get_agent_file_tree(
+    AxumPath(agent_id): AxumPath<String>,
+    Query(query): Query<FilePathQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<FileTreeResult>, (StatusCode, Json<ErrorResponse>)> {
+    let result = dispatch_agent_command::<FileTreeResult>(
+        &state.agent_registry,
+        &agent_id,
+        AgentCommand::FileTree(FileTreeRequest {
+            logical_path: query.path,
+        }),
+    )
+    .await?;
+
+    Ok(Json(result))
+}
+
+async fn get_agent_file_content(
+    AxumPath(agent_id): AxumPath<String>,
+    Query(query): Query<FilePathQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<FileReadResult>, (StatusCode, Json<ErrorResponse>)> {
+    let result = dispatch_agent_command::<FileReadResult>(
+        &state.agent_registry,
+        &agent_id,
+        AgentCommand::FileRead(FileReadRequest {
+            logical_path: query.path,
+        }),
+    )
+    .await?;
+
+    Ok(Json(result))
+}
+
+async fn put_agent_file_content(
+    AxumPath(agent_id): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<FileWriteRequestBody>,
+) -> Result<Json<FileWriteResult>, (StatusCode, Json<ErrorResponse>)> {
+    let result = dispatch_agent_command::<FileWriteResult>(
+        &state.agent_registry,
+        &agent_id,
+        AgentCommand::FileWrite(FileWriteRequest {
+            logical_path: payload.logical_path,
+            content: payload.content,
+            expected_version: payload.expected_version,
+        }),
+    )
+    .await?;
+
+    Ok(Json(result))
 }
 
 impl AppConfig {
@@ -261,6 +325,41 @@ async fn delete_server(
         message: "服务器删除成功".to_string(),
         server_uuid,
     }))
+}
+
+async fn dispatch_agent_command<T>(
+    registry: &AgentRegistry,
+    agent_id: &str,
+    command: AgentCommand,
+) -> Result<T, (StatusCode, Json<ErrorResponse>)>
+where
+    T: DeserializeOwned,
+{
+    let result = registry
+        .dispatch_command(agent_id, command)
+        .await
+        .map_err(|message| map_dispatch_error(&message))?;
+
+    if !result.success {
+        let message = result
+            .error
+            .unwrap_or_else(|| "agent command failed".to_string());
+        return Err(error_response(StatusCode::BAD_REQUEST, &message));
+    }
+
+    let payload = result.payload.ok_or_else(|| {
+        error_response(
+            StatusCode::BAD_GATEWAY,
+            "agent command succeeded but payload is missing",
+        )
+    })?;
+
+    serde_json::from_value(payload).map_err(|err| {
+        error_response(
+            StatusCode::BAD_GATEWAY,
+            &format!("agent returned invalid payload: {err}"),
+        )
+    })
 }
 
 fn validate_server_payload(
@@ -489,4 +588,15 @@ fn error_response(status: StatusCode, message: &str) -> (StatusCode, Json<ErrorR
             message: message.to_string(),
         }),
     )
+}
+
+fn map_dispatch_error(message: &str) -> (StatusCode, Json<ErrorResponse>) {
+    if message.contains("offline") {
+        return error_response(StatusCode::CONFLICT, message);
+    }
+    if message.contains("timed out") {
+        return error_response(StatusCode::GATEWAY_TIMEOUT, message);
+    }
+
+    error_response(StatusCode::BAD_GATEWAY, message)
 }

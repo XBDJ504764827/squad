@@ -25,6 +25,14 @@ pub struct WriteFileResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTreeResult {
+    pub entries: Vec<FileTreeEntry>,
+}
+
+pub type FileReadResult = ReadFileResult;
+pub type FileWriteResult = WriteFileResult;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceRootSummary {
     pub name: String,
@@ -137,9 +145,34 @@ pub struct AgentRegistered {
 pub struct AgentHeartbeat {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+pub struct FileTreeRequest {
+    pub logical_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileReadRequest {
+    pub logical_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileWriteRequest {
+    pub logical_path: String,
+    pub content: String,
+    pub expected_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
 pub enum AgentCommand {
+    #[serde(rename = "ping")]
     Ping,
+    #[serde(rename = "file.tree")]
+    FileTree(FileTreeRequest),
+    #[serde(rename = "file.read")]
+    FileRead(FileReadRequest),
+    #[serde(rename = "file.write")]
+    FileWrite(FileWriteRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

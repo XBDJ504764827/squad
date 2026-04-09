@@ -3,14 +3,15 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::{
-    AgentCommand, AgentCommandHandler, AgentConfig, AgentError, AgentRegistration, FileService,
-    LogParser, PathPolicy, Transport, WorkspaceRootSummary,
+    AgentCommand, AgentCommandHandler, AgentConfig, AgentError, AgentRegistration, FileReadResult,
+    FileService, FileTreeResult, FileWriteResult, LogParser, PathPolicy, Transport,
+    WorkspaceRootSummary,
 };
 
 pub async fn run(config: AgentConfig) -> Result<()> {
     let path_policy = PathPolicy::new(&config.workspace_roots())?;
     let file_service = FileService::new(path_policy, config.file_service_config());
-    let parser = LogParser::new(config.parse_rules.clone())?;
+    let _parser = LogParser::new(config.parse_rules.clone())?;
 
     info!(
         agent_id = %config.agent_id,
@@ -38,24 +39,61 @@ pub async fn run(config: AgentConfig) -> Result<()> {
             .collect(),
         primary_log_path: config.log_source.primary_path.to_string_lossy().to_string(),
     };
-    let handler = RuntimeCommandHandler {
-        _file_service: file_service,
-        _parser: parser,
-    };
+    let handler = RuntimeCommandHandler::new(file_service);
     transport.run(registration, &handler).await?;
 
     Ok(())
 }
 
-struct RuntimeCommandHandler {
-    _file_service: FileService,
-    _parser: LogParser,
+pub struct RuntimeCommandHandler {
+    file_service: FileService,
+}
+
+impl RuntimeCommandHandler {
+    pub fn new(file_service: FileService) -> Self {
+        Self { file_service }
+    }
 }
 
 impl AgentCommandHandler for RuntimeCommandHandler {
     fn handle_command(&self, command: AgentCommand) -> Result<Option<Value>, AgentError> {
         match command {
             AgentCommand::Ping => Ok(crate::transport::default_ping_response()),
+            AgentCommand::FileTree(request) => {
+                let entries = self.file_service.list_tree(&request.logical_path)?;
+                serde_json::to_value(FileTreeResult { entries })
+                    .map(Some)
+                    .map_err(|err| {
+                        AgentError::Runtime(format!("failed to serialize file tree result: {err}"))
+                    })
+            }
+            AgentCommand::FileRead(request) => {
+                let result = self.file_service.read_text_file(&request.logical_path)?;
+                serde_json::to_value(FileReadResult {
+                    logical_path: result.logical_path,
+                    content: result.content,
+                    version: result.version,
+                })
+                .map(Some)
+                .map_err(|err| {
+                    AgentError::Runtime(format!("failed to serialize file read result: {err}"))
+                })
+            }
+            AgentCommand::FileWrite(request) => {
+                let result = self.file_service.write_text_file(
+                    &request.logical_path,
+                    &request.content,
+                    request.expected_version.as_deref(),
+                )?;
+                serde_json::to_value(FileWriteResult {
+                    logical_path: result.logical_path,
+                    version: result.version,
+                })
+                .map(Some)
+                .map_err(|err| {
+                    AgentError::Runtime(format!("failed to serialize file write result: {err}"))
+                })
+            }
         }
     }
 }
