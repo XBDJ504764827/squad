@@ -59,6 +59,14 @@ export const dashboardApi = {
   async getServer(serverUuid) {
     return request(`/servers/${serverUuid}`)
   },
+  async getServerAgentAuth(serverUuid) {
+    return request(`/servers/${serverUuid}/agent-auth`)
+  },
+  async rotateServerAgentKey(serverUuid) {
+    return request(`/servers/${serverUuid}/agent-auth-key`, {
+      method: 'POST',
+    })
+  },
   async addServer(payload) {
     return request('/servers', {
       method: 'POST',

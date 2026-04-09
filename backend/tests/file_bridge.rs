@@ -45,8 +45,9 @@ async fn register_agent(
         .expect("websocket upgrade should succeed");
 
     let registration = AgentClientMessage::Register(AgentRegistration {
+        server_uuid: "server-1".to_string(),
         agent_id: "agent-1".to_string(),
-        token: "test-token".to_string(),
+        auth_key: "test-auth-key".to_string(),
         platform: AgentPlatform::Linux,
         version: "0.1.0".to_string(),
         workspace_roots: vec![WorkspaceRootSummary {

@@ -3,7 +3,7 @@ pub mod agent_ws;
 pub mod models;
 pub mod rcon;
 
-use std::{collections::HashMap, convert::Infallible, env, net::SocketAddr, path::Path};
+use std::{convert::Infallible, env, net::SocketAddr, path::Path};
 
 use axum::{
     Json, Router,
@@ -21,10 +21,12 @@ use models::{
     ActionResponse, AddServerRequest, AgentCommand, AgentStreamEvent, DashboardResponse,
     ErrorResponse, FilePathQuery, FileReadRequest, FileReadResult, FileTreeRequest, FileTreeResult,
     FileWriteRequest, FileWriteRequestBody, FileWriteResult, HealthResponse, ManagedServer,
-    ManagedServerDetailResponse, OnlineAgentSummary, ServerAgentBindingResponse,
+    ManagedServerDetailResponse, OnlineAgentSummary, ServerAgentAuthResponse,
+    ServerAgentBindingResponse,
     UpdateServerAgentBindingRequest, UpdateServerRequest,
 };
 use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
@@ -103,6 +105,11 @@ pub fn build_app_with_registry(db: PgPool, agent_registry: AgentRegistry) -> Rou
                 .put(put_server_agent_binding)
                 .delete(delete_server_agent_binding),
         )
+        .route("/api/servers/{server_uuid}/agent-auth", get(get_server_agent_auth))
+        .route(
+            "/api/servers/{server_uuid}/agent-auth-key",
+            post(post_server_agent_auth_key),
+        )
         .with_state(AppState { db, agent_registry })
         .layer(
             CorsLayer::new()
@@ -116,7 +123,7 @@ async fn connect_agent_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| agent_ws::serve(socket, state.agent_registry))
+    ws.on_upgrade(move |socket| agent_ws::serve(socket, state.agent_registry, state.db))
 }
 
 async fn stream_agent_events(
@@ -241,20 +248,12 @@ async fn dashboard(
 async fn list_online_agents(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<OnlineAgentSummary>>, (StatusCode, Json<ErrorResponse>)> {
-    let binding_by_agent = fetch_all_server_agent_bindings(&state.db)
-        .await
-        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取 agent 绑定关系失败"))?
-        .into_iter()
-        .map(|binding| (binding.agent_id, binding.server_uuid))
-        .collect::<HashMap<_, _>>();
-
     let mut items = state
         .agent_registry
         .list()
         .await
         .into_iter()
         .map(|agent| {
-            let bound_server_uuid = binding_by_agent.get(&agent.registration.agent_id).cloned();
             OnlineAgentSummary {
                 agent_id: agent.registration.agent_id.clone(),
                 platform: agent.registration.platform.clone(),
@@ -263,8 +262,8 @@ async fn list_online_agents(
                 primary_log_path: agent.registration.primary_log_path.clone(),
                 connected_at: agent.connected_at_ms,
                 last_heartbeat_at: agent.last_heartbeat_at_ms,
-                is_bound: bound_server_uuid.is_some(),
-                bound_server_uuid,
+                is_bound: !agent.registration.server_uuid.is_empty(),
+                bound_server_uuid: Some(agent.registration.server_uuid.clone()),
             }
         })
         .collect::<Vec<_>>();
@@ -283,10 +282,14 @@ async fn get_server(
         .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器详情失败"))?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "服务器不存在"))?;
 
+    let online_agent = state.agent_registry.get_by_server_uuid(&server_uuid).await;
+
     Ok(Json(ManagedServerDetailResponse::from_server(
         &server,
-        None,
-        None,
+        online_agent
+            .as_ref()
+            .map(|agent| agent.registration.agent_id.as_str()),
+        online_agent.as_ref(),
     )))
 }
 
@@ -354,6 +357,59 @@ async fn add_server(
         message: "服务器添加成功，RCON 验证已通过".to_string(),
         server_uuid,
     }))
+}
+
+async fn get_server_agent_auth(
+    AxumPath(server_uuid): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<ServerAgentAuthResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !server_exists(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器失败"))?
+    {
+        return Err(error_response(StatusCode::NOT_FOUND, "服务器不存在"));
+    }
+
+    let auth = fetch_server_agent_auth_by_server_uuid(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取 agent 鉴权状态失败"))?;
+    let online_agent = state.agent_registry.get_by_server_uuid(&server_uuid).await;
+
+    Ok(Json(ServerAgentAuthResponse::from_auth(
+        &server_uuid,
+        auth.as_ref().map(|record| record.key_preview.clone()),
+        auth.as_ref().map(|record| record.rotated_at_ms as u64),
+        None,
+        online_agent.as_ref(),
+    )))
+}
+
+async fn post_server_agent_auth_key(
+    AxumPath(server_uuid): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<ServerAgentAuthResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !server_exists(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器失败"))?
+    {
+        return Err(error_response(StatusCode::NOT_FOUND, "服务器不存在"));
+    }
+
+    let plain_key = generate_agent_auth_key();
+    let key_preview = build_agent_auth_key_preview(&plain_key);
+    let key_hash = hash_agent_auth_key(&plain_key);
+    let auth = upsert_server_agent_auth(&state.db, &server_uuid, &key_hash, &key_preview)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "写入 agent key 失败"))?;
+    let online_agent = state.agent_registry.get_by_server_uuid(&server_uuid).await;
+
+    Ok(Json(ServerAgentAuthResponse::from_auth(
+        &server_uuid,
+        Some(auth.key_preview),
+        Some(auth.rotated_at_ms as u64),
+        Some(plain_key),
+        online_agent.as_ref(),
+    )))
 }
 
 async fn update_server(
@@ -652,6 +708,18 @@ async fn initialize_database(db: &PgPool) -> Result<(), sqlx::Error> {
 
     sqlx::query(
         r#"
+        DELETE FROM server_agent_bindings
+        WHERE server_uuid NOT IN (
+            SELECT server_uuid
+            FROM managed_servers
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
         DO $$
         BEGIN
             IF NOT EXISTS (
@@ -662,6 +730,54 @@ async fn initialize_database(db: &PgPool) -> Result<(), sqlx::Error> {
             ) THEN
                 ALTER TABLE server_agent_bindings
                 ADD CONSTRAINT server_agent_bindings_server_uuid_fkey
+                FOREIGN KEY (server_uuid)
+                REFERENCES managed_servers (server_uuid)
+                ON DELETE CASCADE;
+            END IF;
+        END $$;
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS server_agent_auth (
+            server_uuid TEXT PRIMARY KEY,
+            key_hash TEXT NOT NULL,
+            key_preview TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            rotated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM server_agent_auth
+        WHERE server_uuid NOT IN (
+            SELECT server_uuid
+            FROM managed_servers
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname = 'server_agent_auth_server_uuid_fkey'
+                  AND conrelid = 'server_agent_auth'::regclass
+            ) THEN
+                ALTER TABLE server_agent_auth
+                ADD CONSTRAINT server_agent_auth_server_uuid_fkey
                 FOREIGN KEY (server_uuid)
                 REFERENCES managed_servers (server_uuid)
                 ON DELETE CASCADE;
@@ -695,16 +811,31 @@ struct ServerAgentBindingRecord {
     agent_id: String,
 }
 
-async fn fetch_all_server_agent_bindings(
+#[derive(Clone, FromRow)]
+struct ServerAgentAuthRecord {
+    _server_uuid: String,
+    key_hash: String,
+    key_preview: String,
+    rotated_at_ms: i64,
+}
+
+async fn fetch_server_agent_auth_by_server_uuid(
     db: &PgPool,
-) -> Result<Vec<ServerAgentBindingRecord>, sqlx::Error> {
-    sqlx::query_as::<_, ServerAgentBindingRecord>(
+    server_uuid: &str,
+) -> Result<Option<ServerAgentAuthRecord>, sqlx::Error> {
+    sqlx::query_as::<_, ServerAgentAuthRecord>(
         r#"
-        SELECT server_uuid, agent_id
-        FROM server_agent_bindings
+        SELECT
+            server_uuid AS _server_uuid,
+            key_hash,
+            key_preview,
+            CAST(EXTRACT(EPOCH FROM rotated_at) * 1000 AS BIGINT) AS rotated_at_ms
+        FROM server_agent_auth
+        WHERE server_uuid = $1
         "#,
     )
-    .fetch_all(db)
+    .bind(server_uuid)
+    .fetch_optional(db)
     .await
 }
 
@@ -779,6 +910,59 @@ async fn delete_server_agent_binding_record(
     Ok(())
 }
 
+async fn upsert_server_agent_auth(
+    db: &PgPool,
+    server_uuid: &str,
+    key_hash: &str,
+    key_preview: &str,
+) -> Result<ServerAgentAuthRecord, sqlx::Error> {
+    sqlx::query_as::<_, ServerAgentAuthRecord>(
+        r#"
+        INSERT INTO server_agent_auth (server_uuid, key_hash, key_preview)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (server_uuid) DO UPDATE
+        SET key_hash = EXCLUDED.key_hash,
+            key_preview = EXCLUDED.key_preview,
+            rotated_at = NOW()
+        RETURNING
+            server_uuid AS _server_uuid,
+            key_hash,
+            key_preview,
+            CAST(EXTRACT(EPOCH FROM rotated_at) * 1000 AS BIGINT) AS rotated_at_ms
+        "#,
+    )
+    .bind(server_uuid)
+    .bind(key_hash)
+    .bind(key_preview)
+    .fetch_one(db)
+    .await
+}
+
+pub(crate) async fn verify_agent_registration_auth(
+    db: &PgPool,
+    registration: &crate::models::AgentRegistration,
+) -> Result<(), String> {
+    let exists = server_exists(db, &registration.server_uuid)
+        .await
+        .map_err(|err| format!("failed to read server: {err}"))?;
+    if !exists {
+        return Err("server not found".to_string());
+    }
+
+    let Some(auth) = fetch_server_agent_auth_by_server_uuid(db, &registration.server_uuid)
+        .await
+        .map_err(|err| format!("failed to read agent auth key: {err}"))?
+    else {
+        return Err("agent auth key is not provisioned".to_string());
+    };
+
+    if hash_agent_auth_key(&registration.auth_key) != auth.key_hash {
+        return Err("agent auth key is invalid".to_string());
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,6 +1005,98 @@ mod tests {
         .expect("failed to query server_agent_bindings foreign key");
 
         assert!(constraint_count > 0);
+    }
+
+    #[tokio::test]
+    async fn initialize_database_removes_orphaned_server_agent_auth_rows_before_adding_fk() {
+        let env_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
+        from_path_override(&env_path).ok();
+
+        let config = AppConfig::from_env();
+        let db = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&config.database_url)
+            .await
+            .expect("failed to connect to PostgreSQL");
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS managed_servers (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                ip TEXT NOT NULL,
+                rcon_port INTEGER NOT NULL,
+                rcon_password TEXT NOT NULL,
+                server_uuid TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (ip, rcon_port)
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .expect("failed to create managed_servers");
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS server_agent_auth (
+                server_uuid TEXT PRIMARY KEY,
+                key_hash TEXT NOT NULL,
+                key_preview TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                rotated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            "#,
+        )
+        .execute(&db)
+        .await
+        .expect("failed to create server_agent_auth");
+
+        sqlx::query(
+            r#"
+            ALTER TABLE server_agent_auth
+            DROP CONSTRAINT IF EXISTS server_agent_auth_server_uuid_fkey
+            "#,
+        )
+        .execute(&db)
+        .await
+        .expect("failed to drop server_agent_auth foreign key");
+
+        let orphan_server_uuid = format!("orphan-{}", Uuid::new_v4());
+        sqlx::query(
+            r#"
+            INSERT INTO server_agent_auth (server_uuid, key_hash, key_preview)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (server_uuid) DO UPDATE
+            SET key_hash = EXCLUDED.key_hash,
+                key_preview = EXCLUDED.key_preview,
+                rotated_at = NOW()
+            "#,
+        )
+        .bind(&orphan_server_uuid)
+        .bind("orphan-hash")
+        .bind("orph...uuid")
+        .execute(&db)
+        .await
+        .expect("failed to insert orphan auth row");
+
+        initialize_database(&db)
+            .await
+            .expect("failed to initialize PostgreSQL schema");
+
+        let orphan_count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM server_agent_auth
+            WHERE server_uuid = $1
+            "#,
+        )
+        .bind(&orphan_server_uuid)
+        .fetch_one(&db)
+        .await
+        .expect("failed to query orphan auth row");
+
+        assert_eq!(orphan_count, 0);
     }
 }
 
@@ -956,6 +1232,32 @@ fn error_response(status: StatusCode, message: &str) -> (StatusCode, Json<ErrorR
             message: message.to_string(),
         }),
     )
+}
+
+fn generate_agent_auth_key() -> String {
+    format!(
+        "{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
+fn build_agent_auth_key_preview(key: &str) -> String {
+    if key.len() <= 8 {
+        return key.to_string();
+    }
+
+    format!("{}...{}", &key[..4], &key[key.len() - 4..])
+}
+
+fn hash_agent_auth_key(key: &str) -> String {
+    let pepper = env::var("AGENT_AUTH_PEPPER")
+        .unwrap_or_else(|_| "squad-dev-agent-auth-pepper".to_string());
+    let mut hasher = Sha256::new();
+    hasher.update(pepper.as_bytes());
+    hasher.update(b":");
+    hasher.update(key.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 fn map_dispatch_error(message: &str) -> (StatusCode, Json<ErrorResponse>) {

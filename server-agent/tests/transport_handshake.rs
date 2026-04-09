@@ -10,8 +10,9 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 fn make_registration() -> AgentRegistration {
     AgentRegistration {
+        server_uuid: "server-1".to_string(),
         agent_id: "agent-1".to_string(),
-        token: "test-token".to_string(),
+        auth_key: "test-auth-key".to_string(),
         platform: AgentPlatform::Linux,
         version: "0.1.0".to_string(),
         workspace_roots: vec![WorkspaceRootSummary {
@@ -45,8 +46,9 @@ async fn connect_sends_registration_and_waits_for_registered_ack() {
 
         match register {
             AgentClientMessage::Register(payload) => {
+                assert_eq!(payload.server_uuid, "server-1");
                 assert_eq!(payload.agent_id, "agent-1");
-                assert_eq!(payload.token, "test-token");
+                assert_eq!(payload.auth_key, "test-auth-key");
                 assert_eq!(payload.workspace_roots[0].logical_path, "/game-root");
             }
             AgentClientMessage::Heartbeat(_)

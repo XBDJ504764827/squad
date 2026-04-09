@@ -91,6 +91,16 @@ impl AgentRegistry {
             .collect()
     }
 
+    pub async fn get_by_server_uuid(&self, server_uuid: &str) -> Option<OnlineAgent> {
+        self.sessions
+            .read()
+            .await
+            .values()
+            .map(|session| session.online_agent.clone())
+            .filter(|agent| agent.registration.server_uuid == server_uuid)
+            .max_by_key(|agent| agent.connected_at_ms)
+    }
+
     pub async fn record_heartbeat(&self, agent_id: &str, session_id: &str) {
         let mut guard = self.sessions.write().await;
         if let Some(session) = guard.get_mut(agent_id) {

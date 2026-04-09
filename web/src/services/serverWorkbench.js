@@ -21,6 +21,22 @@ export function normalizeWorkbenchSection(sectionId) {
   return SECTION_IDS.has(sectionId) ? sectionId : DEFAULT_WORKBENCH_SECTION
 }
 
+export function canUseAgentWorkbench(server) {
+  return Boolean(server?.hasKey && server?.agentOnline && server?.agentId)
+}
+
+export function describeAgentAuthStatus(server) {
+  if (!server?.hasKey) {
+    return '未生成 Agent Key'
+  }
+
+  if (!server?.agentOnline) {
+    return '已生成 Key，等待 Agent 连接'
+  }
+
+  return 'Agent 在线，可进行测试'
+}
+
 const REALTIME_LOG_TEMPLATES = [
   { level: 'INFO', source: 'server', message: '开始同步世界状态快照' },
   { level: 'SYSTEM', source: 'scheduler', message: '定时任务 heartbeat tick=60ms 正常' },

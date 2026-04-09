@@ -18,13 +18,28 @@ use backend::{
     },
 };
 use dotenvy::from_path_override;
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::mpsc;
 use tower::ServiceExt;
 use uuid::Uuid;
 
 static NEXT_TEST_RCON_PORT: AtomicU16 = AtomicU16::new(31000);
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerAgentAuthResponse {
+    server_uuid: String,
+    has_key: bool,
+    key_preview: Option<String>,
+    plain_key: Option<String>,
+    rotated_at: Option<u64>,
+    agent_online: bool,
+    agent_id: Option<String>,
+    last_heartbeat_at: Option<u64>,
+    workspace_roots: Vec<WorkspaceRootSummary>,
+    primary_log_path: String,
+}
 
 fn make_lazy_db() -> sqlx::PgPool {
     PgPoolOptions::new()
@@ -77,6 +92,21 @@ async fn ensure_binding_tables(db: &sqlx::PgPool) {
     .execute(db)
     .await
     .expect("server_agent_bindings table should exist");
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS server_agent_auth (
+            server_uuid TEXT PRIMARY KEY,
+            key_hash TEXT NOT NULL,
+            key_preview TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            rotated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(db)
+    .await
+    .expect("server_agent_auth table should exist");
 }
 
 fn next_test_rcon_port() -> i32 {
@@ -127,6 +157,10 @@ async fn insert_binding_fixture(db: &sqlx::PgPool, server_uuid: &str, agent_id: 
 }
 
 async fn cleanup_server_fixture(db: &sqlx::PgPool, server_uuid: &str) {
+    let _ = sqlx::query("DELETE FROM server_agent_auth WHERE server_uuid = $1")
+        .bind(server_uuid)
+        .execute(db)
+        .await;
     let _ = sqlx::query("DELETE FROM server_agent_bindings WHERE server_uuid = $1")
         .bind(server_uuid)
         .execute(db)
@@ -139,6 +173,7 @@ async fn cleanup_server_fixture(db: &sqlx::PgPool, server_uuid: &str) {
 
 async fn register_online_agent(
     registry: &AgentRegistry,
+    server_uuid: &str,
     agent_id: &str,
     primary_log_path: &str,
 ) -> OnlineAgent {
@@ -146,8 +181,9 @@ async fn register_online_agent(
     registry
         .register(
             AgentRegistration {
+                server_uuid: server_uuid.to_string(),
                 agent_id: agent_id.to_string(),
-                token: "test-token".to_string(),
+                auth_key: "test-auth-key".to_string(),
                 platform: AgentPlatform::Linux,
                 version: "0.1.0".to_string(),
                 workspace_roots: vec![WorkspaceRootSummary {
@@ -278,6 +314,37 @@ async fn server_agent_binding_routes_exist() {
     assert_ne!(delete_response.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn server_agent_auth_routes_exist() {
+    let db = make_lazy_db();
+    let app = build_app(db);
+
+    let get_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/servers/test-server-uuid/agent-auth")
+                .method("GET")
+                .body(Body::empty())
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+    assert_ne!(get_response.status(), StatusCode::NOT_FOUND);
+
+    let post_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/servers/test-server-uuid/agent-auth-key")
+                .method("POST")
+                .body(Body::empty())
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+    assert_ne!(post_response.status(), StatusCode::NOT_FOUND);
+}
+
 #[test]
 fn server_detail_response_includes_agent_metadata_from_online_agent() {
     let server_uuid = "server-1".to_string();
@@ -289,8 +356,9 @@ fn server_detail_response_includes_agent_metadata_from_online_agent() {
         rcon_password: "secret".to_string(),
     };
     let registration = AgentRegistration {
+        server_uuid: "server-1".to_string(),
         agent_id: server_uuid.clone(),
-        token: "test-token".to_string(),
+        auth_key: "test-auth-key".to_string(),
         platform: AgentPlatform::Linux,
         version: "0.1.0".to_string(),
         workspace_roots: vec![WorkspaceRootSummary {
@@ -361,8 +429,9 @@ fn server_agent_binding_response_includes_binding_and_online_agent_metadata() {
         connected_at_ms: 1,
         last_heartbeat_at_ms: 99,
         registration: AgentRegistration {
+            server_uuid: "server-1".to_string(),
             agent_id: "agent-7".to_string(),
-            token: "test-token".to_string(),
+            auth_key: "test-auth-key".to_string(),
             platform: AgentPlatform::Linux,
             version: "0.1.0".to_string(),
             workspace_roots: vec![WorkspaceRootSummary {
@@ -468,7 +537,13 @@ async fn put_server_agent_binding_persists_binding_and_reads_online_state() {
     insert_server_fixture(&db, &server_uuid).await;
 
     let registry = AgentRegistry::default();
-    let online_agent = register_online_agent(&registry, "agent-online", "/srv/game/server.log").await;
+    let online_agent = register_online_agent(
+        &registry,
+        &server_uuid,
+        "agent-online",
+        "/srv/game/server.log",
+    )
+    .await;
     let app = build_app_with_registry(db.clone(), registry);
 
     let put_response = app
@@ -600,6 +675,72 @@ async fn delete_server_agent_binding_is_idempotent() {
     let body: ServerAgentBindingResponse = read_json(get_response).await;
     assert_eq!(body.agent_id, None);
     assert!(!body.agent_online);
+
+    cleanup_server_fixture(&db, &server_uuid).await;
+}
+
+#[tokio::test]
+async fn post_server_agent_auth_key_rotates_key_and_get_reads_status() {
+    let db = make_test_db().await;
+    let server_uuid = format!("server-{}", Uuid::new_v4());
+    insert_server_fixture(&db, &server_uuid).await;
+    let app = build_app(db.clone());
+
+    let first_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/servers/{server_uuid}/agent-auth-key"))
+                .method("POST")
+                .body(Body::empty())
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_body: ServerAgentAuthResponse = read_json(first_response).await;
+    assert_eq!(first_body.server_uuid, server_uuid);
+    assert!(first_body.has_key);
+    assert!(first_body.plain_key.as_deref().unwrap_or_default().len() >= 16);
+    assert!(!first_body.key_preview.as_deref().unwrap_or_default().is_empty());
+    assert!(first_body.rotated_at.is_some());
+    assert!(!first_body.agent_online);
+    assert_eq!(first_body.agent_id, None);
+    assert_eq!(first_body.last_heartbeat_at, None);
+    assert!(first_body.workspace_roots.is_empty());
+    assert_eq!(first_body.primary_log_path, "");
+
+    let second_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/servers/{server_uuid}/agent-auth-key"))
+                .method("POST")
+                .body(Body::empty())
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let second_body: ServerAgentAuthResponse = read_json(second_response).await;
+    assert_ne!(first_body.plain_key, second_body.plain_key);
+
+    let get_response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/servers/{server_uuid}/agent-auth"))
+                .method("GET")
+                .body(Body::empty())
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let get_body: ServerAgentAuthResponse = read_json(get_response).await;
+    assert_eq!(get_body.server_uuid, server_uuid);
+    assert!(get_body.has_key);
+    assert_eq!(get_body.plain_key, None);
+    assert_eq!(get_body.key_preview, second_body.key_preview);
 
     cleanup_server_fixture(&db, &server_uuid).await;
 }

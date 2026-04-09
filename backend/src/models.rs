@@ -347,6 +347,21 @@ pub struct ServerAgentBindingResponse {
     pub last_heartbeat_at: Option<u64>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerAgentAuthResponse {
+    pub server_uuid: String,
+    pub has_key: bool,
+    pub key_preview: Option<String>,
+    pub plain_key: Option<String>,
+    pub rotated_at: Option<u64>,
+    pub agent_online: bool,
+    pub agent_id: Option<String>,
+    pub last_heartbeat_at: Option<u64>,
+    pub workspace_roots: Vec<WorkspaceRootSummary>,
+    pub primary_log_path: String,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateServerAgentBindingRequest {
@@ -714,6 +729,33 @@ impl ServerAgentBindingResponse {
     }
 }
 
+impl ServerAgentAuthResponse {
+    pub fn from_auth(
+        server_uuid: &str,
+        key_preview: Option<String>,
+        rotated_at: Option<u64>,
+        plain_key: Option<String>,
+        online_agent: Option<&OnlineAgent>,
+    ) -> Self {
+        Self {
+            server_uuid: server_uuid.to_string(),
+            has_key: key_preview.is_some(),
+            key_preview,
+            plain_key,
+            rotated_at,
+            agent_online: online_agent.is_some(),
+            agent_id: online_agent.map(|agent| agent.registration.agent_id.clone()),
+            last_heartbeat_at: online_agent.map(|agent| agent.last_heartbeat_at_ms),
+            workspace_roots: online_agent
+                .map(|agent| agent.registration.workspace_roots.clone())
+                .unwrap_or_default(),
+            primary_log_path: online_agent
+                .map(|agent| agent.registration.primary_log_path.clone())
+                .unwrap_or_default(),
+        }
+    }
+}
+
 fn empty_stat(
     label: &str,
     color: &str,
@@ -772,8 +814,9 @@ pub struct AgentFileChanged {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRegistration {
+    pub server_uuid: String,
     pub agent_id: String,
-    pub token: String,
+    pub auth_key: String,
     pub platform: AgentPlatform,
     pub version: String,
     pub workspace_roots: Vec<WorkspaceRootSummary>,

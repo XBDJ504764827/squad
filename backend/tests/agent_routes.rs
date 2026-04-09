@@ -14,6 +14,7 @@ use backend::{
 };
 use dotenvy::from_path_override;
 use futures::{SinkExt, StreamExt};
+use serde::Deserialize;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use std::{env, path::Path};
@@ -21,6 +22,15 @@ use tower::ServiceExt;
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerAgentAuthResponse {
+    server_uuid: String,
+    has_key: bool,
+    key_preview: Option<String>,
+    plain_key: Option<String>,
+}
 
 fn make_lazy_db() -> sqlx::PgPool {
     PgPoolOptions::new()
@@ -72,6 +82,21 @@ async fn ensure_binding_tables(db: &sqlx::PgPool) {
     .execute(db)
     .await
     .expect("server_agent_bindings table should exist");
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS server_agent_auth (
+            server_uuid TEXT PRIMARY KEY,
+            key_hash TEXT NOT NULL,
+            key_preview TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            rotated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(db)
+    .await
+    .expect("server_agent_auth table should exist");
 }
 
 async fn insert_binding_fixture(db: &sqlx::PgPool, server_uuid: &str, agent_id: &str) {
@@ -117,6 +142,10 @@ async fn insert_binding_fixture(db: &sqlx::PgPool, server_uuid: &str, agent_id: 
 }
 
 async fn cleanup_binding_fixture(db: &sqlx::PgPool, server_uuid: &str) {
+    let _ = sqlx::query("DELETE FROM server_agent_auth WHERE server_uuid = $1")
+        .bind(server_uuid)
+        .execute(db)
+        .await;
     let _ = sqlx::query("DELETE FROM server_agent_bindings WHERE server_uuid = $1")
         .bind(server_uuid)
         .execute(db)
@@ -139,6 +168,26 @@ async fn spawn_app(app: Router) -> (String, JoinHandle<()>) {
     (format!("ws://{address}/api/agents/connect"), server)
 }
 
+async fn provision_agent_auth_key(app: &Router, server_uuid: &str) -> ServerAgentAuthResponse {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/servers/{server_uuid}/agent-auth-key"))
+                .method("POST")
+                .body(Body::empty())
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+    serde_json::from_slice(&body).expect("response body should be valid json")
+}
+
 #[tokio::test]
 async fn agent_websocket_route_accepts_upgrade() {
     let registry = AgentRegistry::default();
@@ -152,17 +201,123 @@ async fn agent_websocket_route_accepts_upgrade() {
 }
 
 #[tokio::test]
-async fn valid_registration_marks_agent_online_and_returns_ack() {
+async fn registration_is_rejected_when_server_key_is_not_provisioned() {
+    let db = make_test_db().await;
+    let server_uuid = format!("server-{}", Uuid::new_v4());
+    insert_binding_fixture(&db, &server_uuid, "legacy-agent").await;
+
     let registry = AgentRegistry::default();
-    let app = build_app_with_registry(make_lazy_db(), registry.clone());
+    let app = build_app_with_registry(db.clone(), registry.clone());
+    let (url, server) = spawn_app(app).await;
+    let (mut socket, _) = connect_async(&url)
+        .await
+        .expect("websocket upgrade should succeed");
+
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "agent.register",
+                "payload": {
+                    "serverUuid": server_uuid,
+                    "agentId": "agent-1",
+                    "authKey": "missing-key",
+                    "platform": "linux",
+                    "version": "0.1.0",
+                    "workspaceRoots": [],
+                    "primaryLogPath": "/srv/game/server.log"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("registration should send");
+
+    let reply = socket
+        .next()
+        .await
+        .expect("rejection frame should exist")
+        .expect("rejection frame should be readable");
+    let text = reply.into_text().expect("rejection should be text");
+    assert!(text.contains("agent auth key is not provisioned"));
+    assert!(registry.get("agent-1").await.is_none());
+
+    cleanup_binding_fixture(&db, &server_uuid).await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn registration_is_rejected_when_server_key_is_invalid() {
+    let db = make_test_db().await;
+    let server_uuid = format!("server-{}", Uuid::new_v4());
+    insert_binding_fixture(&db, &server_uuid, "legacy-agent").await;
+
+    let registry = AgentRegistry::default();
+    let app = build_app_with_registry(db.clone(), registry.clone());
+    let provisioned = provision_agent_auth_key(&app, &server_uuid).await;
+    assert_eq!(provisioned.server_uuid, server_uuid);
+    assert!(provisioned.has_key);
+    assert!(provisioned.key_preview.is_some());
+
+    let (url, server) = spawn_app(app).await;
+    let (mut socket, _) = connect_async(&url)
+        .await
+        .expect("websocket upgrade should succeed");
+
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "agent.register",
+                "payload": {
+                    "serverUuid": server_uuid,
+                    "agentId": "agent-1",
+                    "authKey": "wrong-key",
+                    "platform": "linux",
+                    "version": "0.1.0",
+                    "workspaceRoots": [],
+                    "primaryLogPath": "/srv/game/server.log"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("registration should send");
+
+    let reply = socket
+        .next()
+        .await
+        .expect("rejection frame should exist")
+        .expect("rejection frame should be readable");
+    let text = reply.into_text().expect("rejection should be text");
+    assert!(text.contains("agent auth key is invalid"));
+    assert!(registry.get("agent-1").await.is_none());
+
+    cleanup_binding_fixture(&db, &server_uuid).await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn valid_registration_marks_agent_online_and_returns_ack() {
+    let db = make_test_db().await;
+    let server_uuid = format!("server-{}", Uuid::new_v4());
+    insert_binding_fixture(&db, &server_uuid, "legacy-agent").await;
+
+    let registry = AgentRegistry::default();
+    let app = build_app_with_registry(db.clone(), registry.clone());
+    let provisioned = provision_agent_auth_key(&app, &server_uuid).await;
     let (url, server) = spawn_app(app.clone()).await;
     let (mut socket, _) = connect_async(&url)
         .await
         .expect("websocket upgrade should succeed");
 
     let registration = AgentClientMessage::Register(AgentRegistration {
+        server_uuid: server_uuid.clone(),
         agent_id: "agent-1".to_string(),
-        token: "test-token".to_string(),
+        auth_key: provisioned
+            .plain_key
+            .clone()
+            .expect("plain key should be returned"),
         platform: AgentPlatform::Linux,
         version: "0.1.0".to_string(),
         workspace_roots: vec![WorkspaceRootSummary {
@@ -209,6 +364,7 @@ async fn valid_registration_marks_agent_online_and_returns_ack() {
     );
     assert_eq!(online_agent.registration.workspace_roots.len(), 1);
 
+    cleanup_binding_fixture(&db, &server_uuid).await;
     server.abort();
 }
 
@@ -222,8 +378,9 @@ async fn heartbeat_updates_agent_last_seen_timestamp() {
         .expect("websocket upgrade should succeed");
 
     let registration = AgentClientMessage::Register(AgentRegistration {
+        server_uuid: "server-1".to_string(),
         agent_id: "agent-1".to_string(),
-        token: "test-token".to_string(),
+        auth_key: "test-auth-key".to_string(),
         platform: AgentPlatform::Linux,
         version: "0.1.0".to_string(),
         workspace_roots: vec![WorkspaceRootSummary {
@@ -291,8 +448,9 @@ async fn dispatch_command_bridges_response_between_backend_and_agent() {
         .expect("websocket upgrade should succeed");
 
     let registration = AgentClientMessage::Register(AgentRegistration {
+        server_uuid: "server-1".to_string(),
         agent_id: "agent-1".to_string(),
-        token: "test-token".to_string(),
+        auth_key: "test-auth-key".to_string(),
         platform: AgentPlatform::Linux,
         version: "0.1.0".to_string(),
         workspace_roots: vec![WorkspaceRootSummary {
@@ -376,8 +534,9 @@ async fn log_chunk_is_broadcast_to_agent_event_subscribers() {
         .expect("websocket upgrade should succeed");
 
     let registration = AgentClientMessage::Register(AgentRegistration {
+        server_uuid: "server-1".to_string(),
         agent_id: "agent-1".to_string(),
-        token: "test-token".to_string(),
+        auth_key: "test-auth-key".to_string(),
         platform: AgentPlatform::Linux,
         version: "0.1.0".to_string(),
         workspace_roots: vec![WorkspaceRootSummary {
@@ -447,8 +606,9 @@ async fn file_change_is_broadcast_to_agent_event_subscribers() {
         .expect("websocket upgrade should succeed");
 
     let registration = AgentClientMessage::Register(AgentRegistration {
+        server_uuid: "server-1".to_string(),
         agent_id: "agent-1".to_string(),
-        token: "test-token".to_string(),
+        auth_key: "test-auth-key".to_string(),
         platform: AgentPlatform::Linux,
         version: "0.1.0".to_string(),
         workspace_roots: vec![WorkspaceRootSummary {
@@ -513,16 +673,18 @@ async fn online_agents_route_returns_binding_state_for_registered_agents() {
     let (mut socket_2, _) = connect_async(&url).await.expect("ws should connect");
 
     let registration_1 = AgentClientMessage::Register(AgentRegistration {
+        server_uuid: server_uuid.clone(),
         agent_id: "agent-1".to_string(),
-        token: "test-token".to_string(),
+        auth_key: "test-auth-key".to_string(),
         platform: AgentPlatform::Linux,
         version: "0.1.0".to_string(),
         workspace_roots: vec![],
         primary_log_path: "/srv/game/server.log".to_string(),
     });
     let registration_2 = AgentClientMessage::Register(AgentRegistration {
+        server_uuid: format!("server-{}", Uuid::new_v4()),
         agent_id: "agent-2".to_string(),
-        token: "test-token".to_string(),
+        auth_key: "test-auth-key".to_string(),
         platform: AgentPlatform::Linux,
         version: "0.1.0".to_string(),
         workspace_roots: vec![],

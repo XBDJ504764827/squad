@@ -27,8 +27,9 @@ pub async fn run(config: AgentConfig) -> Result<()> {
 
     let transport = Transport::new(config.backend_ws_url.clone());
     let registration = AgentRegistration {
+        server_uuid: config.server_uuid.clone(),
         agent_id: config.agent_id.clone(),
-        token: config.backend_token.clone(),
+        auth_key: config.auth_key.clone(),
         platform: crate::AgentPlatform::current(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         workspace_roots: config

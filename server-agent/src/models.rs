@@ -136,8 +136,9 @@ pub struct ParsedLogEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRegistration {
+    pub server_uuid: String,
     pub agent_id: String,
-    pub token: String,
+    pub auth_key: String,
     pub platform: AgentPlatform,
     pub version: String,
     pub workspace_roots: Vec<WorkspaceRootSummary>,

@@ -9,7 +9,9 @@ import {
   SERVER_WORKBENCH_SECTIONS,
   appendAgentLogChunk,
   buildConfigFileItems,
+  canUseAgentWorkbench,
   createServerWorkbenchContent,
+  describeAgentAuthStatus,
   filterRealtimeLogEntries,
   normalizeAgentStreamEvent,
   normalizeWorkbenchSection,
@@ -618,6 +620,11 @@ function App() {
   const [deleteServerSubmitting, setDeleteServerSubmitting] = useState(false)
   const [deleteServerError, setDeleteServerError] = useState('')
   const [managedServerDetail, setManagedServerDetail] = useState(null)
+  const [serverAgentAuth, setServerAgentAuth] = useState(null)
+  const [isServerAgentAuthLoading, setIsServerAgentAuthLoading] = useState(false)
+  const [serverAgentAuthError, setServerAgentAuthError] = useState('')
+  const [agentKeySubmitting, setAgentKeySubmitting] = useState(false)
+  const [generatedAgentKey, setGeneratedAgentKey] = useState('')
   const [isServerDetailLoading, setIsServerDetailLoading] = useState(false)
   const [serverDetailError, setServerDetailError] = useState('')
   const [flashMessage, setFlashMessage] = useState(null)
@@ -702,6 +709,24 @@ function App() {
     }
   }
 
+  const loadServerAgentAuth = async (serverUuid) => {
+    setIsServerAgentAuthLoading(true)
+    setServerAgentAuthError('')
+
+    try {
+      const auth = await dashboardApi.getServerAgentAuth(serverUuid)
+      setServerAgentAuth(auth)
+      return auth
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '读取 Agent 鉴权状态失败，请稍后重试。'
+      setServerAgentAuth(null)
+      setServerAgentAuthError(message)
+      throw new Error(message)
+    } finally {
+      setIsServerAgentAuthLoading(false)
+    }
+  }
+
   useEffect(() => {
     let cancelled = false
 
@@ -777,6 +802,18 @@ function App() {
   }, [managedServerDetail?.agentId, selectedServerUuid])
 
   useEffect(() => {
+    setServerAgentAuth(null)
+    setServerAgentAuthError('')
+    setGeneratedAgentKey('')
+  }, [selectedServerUuid])
+
+  const canAccessAgentWorkbench = canUseAgentWorkbench({
+    hasKey: serverAgentAuth?.hasKey,
+    agentOnline: managedServerDetail?.agentOnline,
+    agentId: managedServerDetail?.agentId,
+  })
+
+  useEffect(() => {
     selectedConfigFilePathRef.current = selectedConfigFilePath
     configFileDirtyRef.current = isConfigFileDirty
   }, [selectedConfigFilePath, isConfigFileDirty])
@@ -787,7 +824,7 @@ function App() {
   })
 
   useEffect(() => {
-    if (activeView !== 'server-detail' || !managedServerDetail?.agentId) {
+    if (activeView !== 'server-detail' || !canAccessAgentWorkbench) {
       return undefined
     }
 
@@ -833,10 +870,10 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [activeView, managedServerDetail?.agentId, managedServerDetail?.workspaceRoots, configFileRefreshToken])
+  }, [activeView, canAccessAgentWorkbench, managedServerDetail?.agentId, managedServerDetail?.workspaceRoots, configFileRefreshToken])
 
   useEffect(() => {
-    if (activeView !== 'server-detail' || !managedServerDetail?.agentId || !selectedConfigFilePath) {
+    if (activeView !== 'server-detail' || !canAccessAgentWorkbench || !selectedConfigFilePath) {
       return undefined
     }
 
@@ -884,10 +921,10 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [activeView, managedServerDetail?.agentId, selectedConfigFilePath, configFileItems, configFileRefreshToken])
+  }, [activeView, canAccessAgentWorkbench, managedServerDetail?.agentId, selectedConfigFilePath, configFileItems, configFileRefreshToken])
 
   useEffect(() => {
-    if (activeView !== 'server-detail' || !managedServerDetail?.agentId) {
+    if (activeView !== 'server-detail' || !canAccessAgentWorkbench) {
       return undefined
     }
 
@@ -942,7 +979,7 @@ function App() {
     return () => {
       eventSource.close()
     }
-  }, [activeView, managedServerDetail?.agentId, managedServerDetail?.name, realtimeLogPaused])
+  }, [activeView, canAccessAgentWorkbench, managedServerDetail?.agentId, managedServerDetail?.name, realtimeLogPaused])
 
   useEffect(() => {
     if (!realtimeLogAutoScroll || normalizedWorkbenchSection !== 'realtime-logs') {
@@ -978,6 +1015,9 @@ function App() {
     if (nextView !== 'server-detail') {
       setSelectedServerUuid(null)
       setManagedServerDetail(null)
+      setServerAgentAuth(null)
+      setServerAgentAuthError('')
+      setGeneratedAgentKey('')
       setServerDetailError('')
       setActiveWorkbenchSection(DEFAULT_WORKBENCH_SECTION)
     }
@@ -999,11 +1039,15 @@ function App() {
       if (selectedServerUuid) {
         try {
           const detail = await dashboardApi.getServer(selectedServerUuid)
+          const auth = await dashboardApi.getServerAgentAuth(selectedServerUuid)
           setManagedServerDetail(detail)
+          setServerAgentAuth(auth)
+          setServerAgentAuthError('')
           setServerDetailError('')
         } catch (error) {
           const message = error instanceof Error ? error.message : '读取服务器详情失败，请稍后重试。'
           setManagedServerDetail(null)
+          setServerAgentAuth(null)
           setServerDetailError(message)
         }
       }
@@ -1020,7 +1064,7 @@ function App() {
   }
 
   const handleSaveConfigFile = async () => {
-    if (!managedServerDetail?.agentId || !selectedConfigFilePath) {
+    if (!canAccessAgentWorkbench || !managedServerDetail?.agentId || !selectedConfigFilePath) {
       return
     }
 
@@ -1040,6 +1084,35 @@ function App() {
       setConfigFileError(error instanceof Error ? error.message : '保存配置文件失败')
     } finally {
       setConfigFileSaving(false)
+    }
+  }
+
+  const handleGenerateAgentKey = async () => {
+    if (!selectedServerUuid) {
+      return
+    }
+
+    setAgentKeySubmitting(true)
+    setServerAgentAuthError('')
+    setGeneratedAgentKey('')
+    setFlashMessage(null)
+
+    try {
+      const auth = await dashboardApi.rotateServerAgentKey(selectedServerUuid)
+      setServerAgentAuth(auth)
+      setGeneratedAgentKey(auth.plainKey ?? '')
+
+      const detail = await loadServerDetail(selectedServerUuid)
+      setManagedServerDetail(detail)
+      setFlashMessage({
+        type: 'success',
+        text: auth.hasKey ? 'Agent Key 已生成，请复制到游戏服务器上的 agent 配置。' : 'Agent Key 已更新',
+        serverUuid: auth.serverUuid,
+      })
+    } catch (error) {
+      setServerAgentAuthError(error instanceof Error ? error.message : '生成 Agent Key 失败')
+    } finally {
+      setAgentKeySubmitting(false)
     }
   }
 
@@ -1076,7 +1149,10 @@ function App() {
     setFlashMessage(null)
 
     try {
-      await loadServerDetail(server.uuid)
+      await Promise.all([
+        loadServerDetail(server.uuid),
+        loadServerAgentAuth(server.uuid),
+      ])
     } catch (error) {
       setFlashMessage({
         type: 'error',
@@ -1120,6 +1196,9 @@ function App() {
     setActiveView('server-manager')
     setSelectedServerUuid(null)
     setManagedServerDetail(null)
+    setServerAgentAuth(null)
+    setServerAgentAuthError('')
+    setGeneratedAgentKey('')
     setServerDetailError('')
     setActiveWorkbenchSection(DEFAULT_WORKBENCH_SECTION)
   }
@@ -1170,7 +1249,10 @@ function App() {
       applyDashboardPayload(nextDashboard)
       if (serverFormMode === 'edit' && editingServerUuid) {
         const detail = await dashboardApi.getServer(editingServerUuid)
+        const auth = await dashboardApi.getServerAgentAuth(editingServerUuid)
         setManagedServerDetail(detail)
+        setServerAgentAuth(auth)
+        setServerAgentAuthError('')
         setServerDetailError('')
       }
       setIsServerFormModalOpen(false)
@@ -1209,6 +1291,9 @@ function App() {
       setSelectedServerUuid(nextViewState.selectedServerUuid)
       if (nextViewState.selectedServerUuid === null) {
         setManagedServerDetail(null)
+        setServerAgentAuth(null)
+        setServerAgentAuthError('')
+        setGeneratedAgentKey('')
         setServerDetailError('')
         setActiveWorkbenchSection(DEFAULT_WORKBENCH_SECTION)
       }
@@ -1355,11 +1440,19 @@ function App() {
             rconPassword: '',
             serverUuid: fallbackServer.uuid,
             statusLabel: fallbackServer.status.label,
-            agentId: fallbackServer.uuid,
+            agentId: null,
+            agentOnline: false,
             workspaceRoots: [],
             primaryLogPath: '',
           }
         : null
+    const authAwareServer = detailServer
+      ? {
+          ...detailServer,
+          hasKey: serverAgentAuth?.hasKey ?? false,
+        }
+      : null
+    const authStatusLabel = describeAgentAuthStatus(authAwareServer)
     const workbenchContent = createServerWorkbenchContent(detailServer)
     const sectionContent = workbenchContent[normalizedWorkbenchSection]
     const renderWorkbenchSection = () => {
@@ -1458,6 +1551,14 @@ function App() {
             </div>
           )
         case 'realtime-logs':
+          if (!canAccessAgentWorkbench) {
+            return (
+              <div className="server-detail-empty">
+                <EmptyState message={`${authStatusLabel}，当前不可建立日志连接。`} />
+              </div>
+            )
+          }
+
           return (
             <div className="workbench-stack">
               <div className="card">
@@ -1697,6 +1798,14 @@ function App() {
             </div>
           )
         case 'config-files':
+          if (!canAccessAgentWorkbench) {
+            return (
+              <div className="server-detail-empty">
+                <EmptyState message={`${authStatusLabel}，当前不可浏览或编辑远端文件。`} />
+              </div>
+            )
+          }
+
           return (
             <div className="workbench-config-layout">
               <div className="card">
@@ -1988,6 +2097,37 @@ function App() {
             </div>
             {isServerDetailLoading ? <div className="server-detail-banner">正在同步服务器详情…</div> : null}
             {serverDetailError ? <div className="server-detail-banner error">{serverDetailError}</div> : null}
+            {isServerAgentAuthLoading ? <div className="server-detail-banner">正在同步 Agent 鉴权状态…</div> : null}
+            {serverAgentAuthError ? <div className="server-detail-banner error">{serverAgentAuthError}</div> : null}
+            {detailServer ? (
+              <div className="server-detail-banner">
+                <div>Agent 状态：{authStatusLabel}</div>
+                <div>
+                  当前服务器 UUID：<strong>{detailServer.serverUuid}</strong>
+                  {detailServer.agentId ? ` · 在线 Agent：${detailServer.agentId}` : ''}
+                  {serverAgentAuth?.keyPreview ? ` · Key 预览：${serverAgentAuth.keyPreview}` : ''}
+                </div>
+                <div className="server-detail-actions" style={{ marginTop: '12px' }}>
+                  <button
+                    className="btn btn-primary btn-sm"
+                    type="button"
+                    onClick={handleGenerateAgentKey}
+                    disabled={agentKeySubmitting || !detailServer.serverUuid}
+                  >
+                    <Icon name="key-round" width={13} height={13} />
+                    {serverAgentAuth?.hasKey ? '重置 Agent Key' : '生成 Agent Key'}
+                  </button>
+                </div>
+                {generatedAgentKey ? (
+                  <div style={{ marginTop: '12px', fontFamily: "'DM Mono',monospace", wordBreak: 'break-all' }}>
+                    新 Key：{generatedAgentKey}
+                  </div>
+                ) : null}
+                <div style={{ marginTop: '8px' }}>
+                  将 `server_uuid` 与该 Key 手动填入游戏服务器上的 agent 配置，然后重启 agent 进行联动测试。
+                </div>
+              </div>
+            ) : null}
             {detailServer ? (
               <div className="workbench-section-body">{renderWorkbenchSection()}</div>
             ) : (

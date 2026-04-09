@@ -1,5 +1,6 @@
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
+use sqlx::PgPool;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -7,7 +8,7 @@ use crate::{
     models::{AgentClientMessage, AgentServerMessage},
 };
 
-pub async fn serve(mut socket: WebSocket, registry: AgentRegistry) {
+pub async fn serve(mut socket: WebSocket, registry: AgentRegistry, db: PgPool) {
     let registration = match read_registration(&mut socket).await {
         Ok(registration) => registration,
         Err(message) => {
@@ -16,6 +17,12 @@ pub async fn serve(mut socket: WebSocket, registry: AgentRegistry) {
             return;
         }
     };
+
+    if let Err(message) = crate::verify_agent_registration_auth(&db, &registration).await {
+        let _ = socket.send(Message::Text(message.into())).await;
+        let _ = socket.close().await;
+        return;
+    }
 
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
     let registered = registry.register(registration.clone(), outbound_tx).await;
@@ -132,11 +139,14 @@ async fn read_registration(
         }
     };
 
+    if registration.server_uuid.trim().is_empty() {
+        return Err("server_uuid is required".to_string());
+    }
     if registration.agent_id.trim().is_empty() {
         return Err("agent_id is required".to_string());
     }
-    if registration.token.trim().is_empty() {
-        return Err("token is required".to_string());
+    if registration.auth_key.trim().is_empty() {
+        return Err("auth_key is required".to_string());
     }
 
     Ok(registration)

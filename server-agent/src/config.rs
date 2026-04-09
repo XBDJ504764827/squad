@@ -35,9 +35,12 @@ pub struct FileServiceConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentConfig {
+    #[serde(default)]
+    pub server_uuid: String,
     pub agent_id: String,
     pub backend_ws_url: String,
-    pub backend_token: String,
+    #[serde(default)]
+    pub auth_key: String,
     #[serde(default = "default_encoding")]
     pub default_encoding: String,
     pub log_source: LogSourceConfig,
@@ -77,11 +80,17 @@ impl AgentConfig {
     }
 
     fn normalize(&mut self) -> Result<(), AgentError> {
+        self.server_uuid = self.server_uuid.trim().to_string();
         self.agent_id = self.agent_id.trim().to_string();
         self.backend_ws_url = self.backend_ws_url.trim().to_string();
-        self.backend_token = self.backend_token.trim().to_string();
+        self.auth_key = self.auth_key.trim().to_string();
         self.default_encoding = self.default_encoding.trim().to_string();
 
+        if self.server_uuid.is_empty() {
+            return Err(AgentError::InvalidConfig(
+                "server_uuid is required".to_string(),
+            ));
+        }
         if self.agent_id.is_empty() {
             return Err(AgentError::InvalidConfig(
                 "agent_id is required".to_string(),
@@ -90,6 +99,11 @@ impl AgentConfig {
         if self.backend_ws_url.is_empty() {
             return Err(AgentError::InvalidConfig(
                 "backend_ws_url is required".to_string(),
+            ));
+        }
+        if self.auth_key.is_empty() {
+            return Err(AgentError::InvalidConfig(
+                "auth_key is required".to_string(),
             ));
         }
         if self.workspace.roots.is_empty() {
@@ -128,4 +142,72 @@ fn default_max_file_size() -> u64 {
 
 fn default_encoding() -> String {
     DEFAULT_ENCODING.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+
+    fn write_temp_config(contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "server-agent-config-{}.toml",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        fs::write(&path, contents).expect("config should be written");
+        path
+    }
+
+    #[test]
+    fn load_from_path_requires_server_uuid() {
+        let path = write_temp_config(
+            r#"
+agent_id = "agent-1"
+backend_ws_url = "ws://127.0.0.1:3000/api/agents/connect"
+auth_key = "test-auth-key"
+
+[log_source]
+primary_path = "/tmp/server.log"
+
+[workspace]
+roots = [{ name = "game-root", path = "/tmp/game" }]
+"#,
+        );
+
+        let result = AgentConfig::load_from_path(&path);
+        let _ = fs::remove_file(&path);
+
+        assert!(matches!(
+            result,
+            Err(AgentError::InvalidConfig(message)) if message.contains("server_uuid is required")
+        ));
+    }
+
+    #[test]
+    fn load_from_path_requires_auth_key() {
+        let path = write_temp_config(
+            r#"
+server_uuid = "server-1"
+agent_id = "agent-1"
+backend_ws_url = "ws://127.0.0.1:3000/api/agents/connect"
+
+[log_source]
+primary_path = "/tmp/server.log"
+
+[workspace]
+roots = [{ name = "game-root", path = "/tmp/game" }]
+"#,
+        );
+
+        let result = AgentConfig::load_from_path(&path);
+        let _ = fs::remove_file(&path);
+
+        assert!(matches!(
+            result,
+            Err(AgentError::InvalidConfig(message)) if message.contains("auth_key is required")
+        ));
+    }
 }

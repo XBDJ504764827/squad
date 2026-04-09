@@ -6,7 +6,9 @@ import {
   appendAgentLogChunk,
   appendRealtimeLogEntry,
   buildConfigFileItems,
+  canUseAgentWorkbench,
   createInitialRealtimeLogs,
+  describeAgentAuthStatus,
   filterRealtimeLogEntries,
   normalizeAgentStreamEvent,
   normalizeWorkbenchSection,
@@ -111,4 +113,17 @@ test('buildConfigFileItems keeps files and folders in a stable workbench shape',
   assert.equal(items[0].name, 'game-root')
   assert.equal(items[1].name, 'server.cfg')
   assert.equal(items[1].sizeLabel, '128 B')
+})
+
+test('canUseAgentWorkbench only allows access when key exists and agent is online', () => {
+  assert.equal(canUseAgentWorkbench({ hasKey: false, agentOnline: false, agentId: null }), false)
+  assert.equal(canUseAgentWorkbench({ hasKey: true, agentOnline: false, agentId: 'agent-1' }), false)
+  assert.equal(canUseAgentWorkbench({ hasKey: true, agentOnline: true, agentId: '' }), false)
+  assert.equal(canUseAgentWorkbench({ hasKey: true, agentOnline: true, agentId: 'agent-1' }), true)
+})
+
+test('describeAgentAuthStatus returns user-facing auth state labels', () => {
+  assert.equal(describeAgentAuthStatus({ hasKey: false, agentOnline: false }), '未生成 Agent Key')
+  assert.equal(describeAgentAuthStatus({ hasKey: true, agentOnline: false }), '已生成 Key，等待 Agent 连接')
+  assert.equal(describeAgentAuthStatus({ hasKey: true, agentOnline: true }), 'Agent 在线，可进行测试')
 })
