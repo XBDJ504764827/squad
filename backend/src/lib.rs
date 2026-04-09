@@ -3,7 +3,7 @@ pub mod agent_ws;
 pub mod models;
 pub mod rcon;
 
-use std::{convert::Infallible, env, net::SocketAddr, path::Path};
+use std::{convert::Infallible, env, net::SocketAddr};
 
 use axum::{
     Json, Router,
@@ -15,6 +15,8 @@ use axum::{
     },
     routing::{get, post},
 };
+use dotenvy::dotenv;
+#[cfg(test)]
 use dotenvy::from_path_override;
 use futures::stream;
 use models::{
@@ -48,8 +50,7 @@ struct AppConfig {
 }
 
 pub async fn run() {
-    let env_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
-    from_path_override(&env_path).ok();
+    load_runtime_env();
 
     let config = AppConfig::from_env();
 
@@ -65,7 +66,7 @@ pub async fn run() {
 
     let app = build_app(db);
 
-    let address = SocketAddr::from(([127, 0, 0, 1], config.port));
+    let address = SocketAddr::from(([0, 0, 0, 0], config.port));
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .expect("failed to bind TCP listener");
@@ -75,6 +76,15 @@ pub async fn run() {
     axum::serve(listener, app)
         .await
         .expect("backend server exited unexpectedly");
+}
+
+#[cfg(test)]
+fn default_env_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env")
+}
+
+fn load_runtime_env() {
+    dotenv().ok();
 }
 
 pub fn build_app(db: PgPool) -> Router {
@@ -1298,11 +1308,84 @@ pub(crate) async fn verify_agent_registration_auth(
 mod tests {
     use super::*;
     use crate::models::{ParseRule, ParseRuleKind};
+    use std::{
+        ffi::OsString,
+        fs,
+        sync::{Mutex, OnceLock},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn write_runtime_env_file(contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "backend-runtime-env-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).expect("temp dir should exist");
+        fs::write(path.join(".env"), contents).expect("runtime .env should be written");
+        path
+    }
+
+    fn load_test_env() {
+        let env_path = default_env_path();
+        from_path_override(&env_path).ok();
+    }
+
+    struct RuntimeEnvTestGuard {
+        original_dir: std::path::PathBuf,
+        saved_vars: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl RuntimeEnvTestGuard {
+        fn enter(runtime_dir: &std::path::Path) -> Self {
+            let original_dir = std::env::current_dir().expect("current dir should exist");
+            let saved_vars = ["DATABASE_URL", "PORT", "DATABASE_MAX_CONNECTIONS"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect::<Vec<_>>();
+            for (key, _) in &saved_vars {
+                // 测试需要清理进程环境，保证运行时 .env 行为可重复。
+                unsafe {
+                    std::env::remove_var(key);
+                }
+            }
+            std::env::set_current_dir(runtime_dir).expect("should enter runtime dir");
+            Self {
+                original_dir,
+                saved_vars,
+            }
+        }
+    }
+
+    impl Drop for RuntimeEnvTestGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.original_dir).expect("should restore current dir");
+            for (key, value) in &self.saved_vars {
+                match value {
+                    Some(value) => {
+                        // 恢复测试前的进程环境，避免污染其他用例。
+                        unsafe {
+                            std::env::set_var(key, value);
+                        }
+                    }
+                    None => unsafe {
+                        std::env::remove_var(key);
+                    },
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn initialize_database_does_not_create_server_agent_bindings_table() {
-        let env_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
-        from_path_override(&env_path).ok();
+        load_test_env();
 
         let config = AppConfig::from_env();
         let db = PgPoolOptions::new()
@@ -1327,8 +1410,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_database_removes_orphaned_server_agent_auth_rows_before_adding_fk() {
-        let env_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
-        from_path_override(&env_path).ok();
+        load_test_env();
 
         let config = AppConfig::from_env();
         let db = PgPoolOptions::new()
@@ -1428,6 +1510,54 @@ mod tests {
         }]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_runtime_env_reads_dotenv_from_current_working_directory() {
+        let _guard = env_lock().lock().expect("env lock should succeed");
+        let runtime_dir = write_runtime_env_file(
+            "DATABASE_URL=postgres://runtime:runtime@10.0.0.9:5432/runtime\nPORT=4011\nDATABASE_MAX_CONNECTIONS=3\n",
+        );
+        let _env_guard = RuntimeEnvTestGuard::enter(&runtime_dir);
+
+        load_runtime_env();
+        let config = AppConfig::from_env();
+
+        assert_eq!(
+            config.database_url,
+            "postgres://runtime:runtime@10.0.0.9:5432/runtime"
+        );
+        assert_eq!(config.port, 4011);
+        assert_eq!(config.database_max_connections, 3);
+    }
+
+    #[test]
+    fn load_runtime_env_does_not_override_explicit_environment_variables() {
+        let _guard = env_lock().lock().expect("env lock should succeed");
+        let runtime_dir = write_runtime_env_file(
+            "DATABASE_URL=postgres://runtime:runtime@10.0.0.9:5432/runtime\nPORT=4011\nDATABASE_MAX_CONNECTIONS=3\n",
+        );
+        let _env_guard = RuntimeEnvTestGuard::enter(&runtime_dir);
+
+        // 显式环境变量应优先于当前目录 .env。
+        unsafe {
+            std::env::set_var(
+                "DATABASE_URL",
+                "postgres://explicit:explicit@10.0.0.7:5432/explicit",
+            );
+            std::env::set_var("PORT", "5123");
+            std::env::set_var("DATABASE_MAX_CONNECTIONS", "7");
+        }
+
+        load_runtime_env();
+        let config = AppConfig::from_env();
+
+        assert_eq!(
+            config.database_url,
+            "postgres://explicit:explicit@10.0.0.7:5432/explicit"
+        );
+        assert_eq!(config.port, 5123);
+        assert_eq!(config.database_max_connections, 7);
     }
 }
 
