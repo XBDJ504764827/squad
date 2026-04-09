@@ -356,6 +356,25 @@ async fn server_parse_rules_routes_exist() {
     assert_ne!(put_response.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn server_parsed_events_route_exists() {
+    let db = make_lazy_db();
+    let app = build_app(db);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/servers/test-server-uuid/parsed-events?eventType=chat&limit=50")
+                .method("GET")
+                .body(Body::empty())
+                .expect("request should be built"),
+        )
+        .await
+        .expect("response should be returned");
+
+    assert_ne!(response.status(), StatusCode::NOT_FOUND);
+}
+
 #[test]
 fn server_detail_response_includes_agent_metadata_from_online_agent() {
     let server_uuid = "server-1".to_string();

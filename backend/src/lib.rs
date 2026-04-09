@@ -22,7 +22,8 @@ use models::{
     ErrorResponse, FilePathQuery, FileReadRequest, FileReadResult, FileTreeRequest,
     FileTreeResult, FileWriteRequest, FileWriteRequestBody, FileWriteResult, HealthResponse,
     ManagedServer, ManagedServerDetailResponse, OnlineAgent, OnlineAgentSummary, ParseRule,
-    ParseRuleKind, ReplaceParseRulesRequest, ServerAgentAuthResponse, ServerParseRulesResponse,
+    ParseRuleKind, ParsedEventQuery, ParsedLogEvent, ReplaceParseRulesRequest,
+    ServerAgentAuthResponse, ServerParsedEventsResponse, ServerParseRulesResponse,
     UpdateServerParseRulesRequest, UpdateServerRequest,
 };
 use regex::Regex;
@@ -127,6 +128,10 @@ pub fn build_app_with_registry(db: PgPool, agent_registry: AgentRegistry) -> Rou
         .route(
             "/api/servers/{server_uuid}/parse-rules",
             get(get_server_parse_rules).put(put_server_parse_rules),
+        )
+        .route(
+            "/api/servers/{server_uuid}/parsed-events",
+            get(get_server_parsed_events),
         )
         .with_state(AppState { db, agent_registry })
         .layer(
@@ -570,6 +575,36 @@ async fn put_server_parse_rules(
     )))
 }
 
+async fn get_server_parsed_events(
+    AxumPath(server_uuid): AxumPath<String>,
+    Query(query): Query<ParsedEventQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<ServerParsedEventsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !server_exists(&state.db, &server_uuid)
+        .await
+        .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取服务器失败"))?
+    {
+        return Err(error_response(StatusCode::NOT_FOUND, "服务器不存在"));
+    }
+
+    let limit = query.limit.unwrap_or(100).clamp(1, 200) as i64;
+    let items = fetch_server_parsed_events(
+        &state.db,
+        &server_uuid,
+        query.event_type.as_deref(),
+        query.before,
+        limit,
+    )
+    .await
+    .map_err(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "读取结构化事件失败"))?;
+
+    Ok(Json(ServerParsedEventsResponse::from_items(
+        &server_uuid,
+        query.event_type,
+        items,
+    )))
+}
+
 async fn update_server(
     AxumPath(server_uuid): AxumPath<String>,
     State(state): State<AppState>,
@@ -756,6 +791,9 @@ fn agent_stream_event_to_sse(event: AgentStreamEvent) -> Event {
         AgentStreamEvent::FileChanged(payload) => Event::default()
             .event("agent.fileChanged")
             .data(serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())),
+        AgentStreamEvent::ParsedEvents(payload) => Event::default()
+            .event("agent.parsedEvents")
+            .data(serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())),
     }
 }
 
@@ -924,6 +962,80 @@ async fn initialize_database(db: &PgPool) -> Result<(), sqlx::Error> {
     .execute(db)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS server_parsed_events (
+            id BIGSERIAL PRIMARY KEY,
+            server_uuid TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            rule_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            source TEXT NOT NULL,
+            cursor TEXT NOT NULL,
+            line_number BIGINT NOT NULL,
+            raw_line TEXT NOT NULL,
+            observed_at_ms BIGINT NOT NULL,
+            payload_json JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM server_parsed_events
+        WHERE server_uuid NOT IN (
+            SELECT server_uuid
+            FROM managed_servers
+        )
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS server_parsed_events_server_uuid_observed_idx
+        ON server_parsed_events (server_uuid, observed_at_ms DESC, id DESC)
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS server_parsed_events_server_uuid_event_type_observed_idx
+        ON server_parsed_events (server_uuid, event_type, observed_at_ms DESC, id DESC)
+        "#,
+    )
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname = 'server_parsed_events_server_uuid_fkey'
+                  AND conrelid = 'server_parsed_events'::regclass
+            ) THEN
+                ALTER TABLE server_parsed_events
+                ADD CONSTRAINT server_parsed_events_server_uuid_fkey
+                FOREIGN KEY (server_uuid)
+                REFERENCES managed_servers (server_uuid)
+                ON DELETE CASCADE;
+            END IF;
+        END $$;
+        "#,
+    )
+    .execute(db)
+    .await?;
+
     Ok(())
 }
 
@@ -954,6 +1066,20 @@ pub(crate) struct ServerParseRulesRecord {
     _server_uuid: String,
     rules_json: SqlxJson<Vec<ParseRule>>,
     version: i64,
+}
+
+#[derive(Clone, FromRow)]
+struct ServerParsedEventRow {
+    agent_id: String,
+    rule_id: String,
+    event_type: String,
+    severity: String,
+    source: String,
+    cursor: String,
+    line_number: i64,
+    raw_line: String,
+    observed_at_ms: i64,
+    payload_json: SqlxJson<std::collections::BTreeMap<String, String>>,
 }
 
 async fn fetch_server_agent_auth_by_server_uuid(
@@ -1018,6 +1144,101 @@ async fn upsert_server_parse_rules(
     .await?;
 
     Ok(())
+}
+
+async fn insert_server_parsed_events(
+    db: &PgPool,
+    server_uuid: &str,
+    events: &[ParsedLogEvent],
+) -> Result<(), sqlx::Error> {
+    for event in events {
+        let observed_at_ms = event.observed_at.parse::<i64>().unwrap_or_default();
+        sqlx::query(
+            r#"
+            INSERT INTO server_parsed_events (
+                server_uuid,
+                agent_id,
+                rule_id,
+                event_type,
+                severity,
+                source,
+                cursor,
+                line_number,
+                raw_line,
+                observed_at_ms,
+                payload_json
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            "#,
+        )
+        .bind(server_uuid)
+        .bind(&event.agent_id)
+        .bind(&event.rule_id)
+        .bind(&event.event_type)
+        .bind(&event.severity)
+        .bind(&event.source)
+        .bind(&event.cursor)
+        .bind(event.line_number as i64)
+        .bind(&event.raw_line)
+        .bind(observed_at_ms)
+        .bind(SqlxJson(event.payload.clone()))
+        .execute(db)
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn fetch_server_parsed_events(
+    db: &PgPool,
+    server_uuid: &str,
+    event_type: Option<&str>,
+    before: Option<u64>,
+    limit: i64,
+) -> Result<Vec<ParsedLogEvent>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, ServerParsedEventRow>(
+        r#"
+        SELECT
+            agent_id,
+            rule_id,
+            event_type,
+            severity,
+            source,
+            cursor,
+            line_number,
+            raw_line,
+            observed_at_ms,
+            payload_json
+        FROM server_parsed_events
+        WHERE server_uuid = $1
+          AND ($2::TEXT IS NULL OR event_type = $2)
+          AND ($3::BIGINT IS NULL OR observed_at_ms < $3)
+        ORDER BY observed_at_ms DESC, id DESC
+        LIMIT $4
+        "#,
+    )
+    .bind(server_uuid)
+    .bind(event_type)
+    .bind(before.map(|value| value as i64))
+    .bind(limit)
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ParsedLogEvent {
+            agent_id: row.agent_id,
+            rule_id: row.rule_id,
+            event_type: row.event_type,
+            severity: row.severity,
+            source: row.source,
+            cursor: row.cursor,
+            line_number: row.line_number as u64,
+            raw_line: row.raw_line,
+            observed_at: row.observed_at_ms.to_string(),
+            payload: row.payload_json.0,
+        })
+        .collect())
 }
 
 async fn upsert_server_agent_auth(

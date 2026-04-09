@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::FromRow;
@@ -395,6 +397,43 @@ pub struct ServerParseRulesResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ParsedLogEvent {
+    pub agent_id: String,
+    pub rule_id: String,
+    pub event_type: String,
+    pub severity: String,
+    pub source: String,
+    pub cursor: String,
+    pub line_number: u64,
+    pub raw_line: String,
+    pub observed_at: String,
+    pub payload: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentParsedEvents {
+    pub events: Vec<ParsedLogEvent>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedEventQuery {
+    pub event_type: Option<String>,
+    pub limit: Option<u32>,
+    pub before: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerParsedEventsResponse {
+    pub server_uuid: String,
+    pub event_type: Option<String>,
+    pub items: Vec<ParsedLogEvent>,
+    pub next_before: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OnlineAgentSummary {
     pub agent_id: String,
     pub server_uuid: String,
@@ -781,6 +820,25 @@ impl ServerParseRulesResponse {
     }
 }
 
+impl ServerParsedEventsResponse {
+    pub fn from_items(
+        server_uuid: &str,
+        event_type: Option<String>,
+        items: Vec<ParsedLogEvent>,
+    ) -> Self {
+        let next_before = items
+            .last()
+            .and_then(|item| item.observed_at.parse::<u64>().ok());
+
+        Self {
+            server_uuid: server_uuid.to_string(),
+            event_type,
+            items,
+            next_before,
+        }
+    }
+}
+
 fn empty_stat(
     label: &str,
     color: &str,
@@ -968,6 +1026,8 @@ pub enum AgentStreamEvent {
     LogChunk(AgentLogChunk),
     #[serde(rename = "agent.fileChanged")]
     FileChanged(AgentFileChanged),
+    #[serde(rename = "agent.parsedEvents")]
+    ParsedEvents(AgentParsedEvents),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -983,6 +1043,8 @@ pub enum AgentClientMessage {
     LogChunk(AgentLogChunk),
     #[serde(rename = "agent.fileChanged")]
     FileChanged(AgentFileChanged),
+    #[serde(rename = "agent.parsedEvents")]
+    ParsedEvents(AgentParsedEvents),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

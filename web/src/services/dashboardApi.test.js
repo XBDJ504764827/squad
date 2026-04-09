@@ -40,7 +40,7 @@ test('extractErrorMessage falls back to status code when payload is not json', a
   })
 })
 
-test('agent file api methods call real backend endpoints', async () => {
+test('server-scoped workbench api methods call real backend endpoints', async () => {
   const calls = []
   const originalFetch = globalThis.fetch
 
@@ -53,6 +53,8 @@ test('agent file api methods call real backend endpoints', async () => {
         version: 'v2',
         entries: [],
         content: 'hostname=test\n',
+        rules: [],
+        items: [],
       }),
       {
         status: 200,
@@ -64,25 +66,32 @@ test('agent file api methods call real backend endpoints', async () => {
   }
 
   try {
-    await dashboardApi.getAgentFileTree('agent-1', '/game-root')
-    await dashboardApi.getAgentFileContent('agent-1', '/game-root/server.cfg')
-    await dashboardApi.updateAgentFileContent('agent-1', {
+    await dashboardApi.getServerFileTree('server-1', '/game-root')
+    await dashboardApi.getServerFileContent('server-1', '/game-root/server.cfg')
+    await dashboardApi.updateServerFileContent('server-1', {
       logicalPath: '/game-root/server.cfg',
       content: 'hostname=new\n',
       expectedVersion: 'v1',
     })
+    await dashboardApi.getServerParseRules('server-1')
+    await dashboardApi.updateServerParseRules('server-1', { rules: [] })
+    await dashboardApi.getServerParsedEvents('server-1', { eventType: 'chat', limit: 50 })
   } finally {
     globalThis.fetch = originalFetch
   }
 
-  assert.equal(calls[0][0], '/api/agents/agent-1/files/tree?path=%2Fgame-root')
-  assert.equal(calls[1][0], '/api/agents/agent-1/files/content?path=%2Fgame-root%2Fserver.cfg')
-  assert.equal(calls[2][0], '/api/agents/agent-1/files/content')
+  assert.equal(calls[0][0], '/api/servers/server-1/files/tree?path=%2Fgame-root')
+  assert.equal(calls[1][0], '/api/servers/server-1/files/content?path=%2Fgame-root%2Fserver.cfg')
+  assert.equal(calls[2][0], '/api/servers/server-1/files/content')
   assert.equal(calls[2][1].method, 'PUT')
   assert.match(calls[2][1].body, /"logicalPath":"\/game-root\/server\.cfg"/)
+  assert.equal(calls[3][0], '/api/servers/server-1/parse-rules')
+  assert.equal(calls[4][0], '/api/servers/server-1/parse-rules')
+  assert.equal(calls[4][1].method, 'PUT')
+  assert.equal(calls[5][0], '/api/servers/server-1/parsed-events?eventType=chat&limit=50')
 })
 
-test('openAgentEvents creates an EventSource against the SSE route', () => {
+test('openServerEvents creates an EventSource against the SSE route', () => {
   const events = []
 
   class MockEventSource {
@@ -92,10 +101,10 @@ test('openAgentEvents creates an EventSource against the SSE route', () => {
     }
   }
 
-  const eventSource = dashboardApi.openAgentEvents('agent-1', {
+  const eventSource = dashboardApi.openServerEvents('server-1', {
     EventSourceCtor: MockEventSource,
   })
 
-  assert.equal(events[0], '/api/agents/agent-1/events')
-  assert.equal(eventSource.url, '/api/agents/agent-1/events')
+  assert.equal(events[0], '/api/servers/server-1/events')
+  assert.equal(eventSource.url, '/api/servers/server-1/events')
 })

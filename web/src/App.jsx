@@ -8,6 +8,7 @@ import {
   DEFAULT_WORKBENCH_SECTION,
   SERVER_WORKBENCH_SECTIONS,
   appendAgentLogChunk,
+  buildStructuredEventItems,
   buildConfigFileItems,
   canUseAgentWorkbench,
   createServerWorkbenchContent,
@@ -585,6 +586,35 @@ const NAVIGATION_VIEW_MAP = {
   服务器管理: 'server-manager',
 }
 
+const STRUCTURED_EVENT_TYPES = ['chat', 'flight', 'knockdown', 'match']
+
+function createEmptyStructuredEventItems() {
+  return {
+    chat: [],
+    flight: [],
+    knockdown: [],
+    match: [],
+  }
+}
+
+function createEmptyStructuredEventLoading() {
+  return {
+    chat: false,
+    flight: false,
+    knockdown: false,
+    match: false,
+  }
+}
+
+function createEmptyStructuredEventErrors() {
+  return {
+    chat: '',
+    flight: '',
+    knockdown: '',
+    match: '',
+  }
+}
+
 function App() {
   const [dashboard, setDashboard] = useState(EMPTY_DASHBOARD)
   const [theme, setTheme] = useState('light')
@@ -642,6 +672,14 @@ function App() {
   const [configFileSaving, setConfigFileSaving] = useState(false)
   const [configFileError, setConfigFileError] = useState('')
   const [configFileRefreshToken, setConfigFileRefreshToken] = useState(0)
+  const [serverParseRules, setServerParseRules] = useState({ version: null, rules: [], applied: false, message: '' })
+  const [serverParseRulesDraft, setServerParseRulesDraft] = useState('[]')
+  const [isServerParseRulesLoading, setIsServerParseRulesLoading] = useState(false)
+  const [isServerParseRulesSaving, setIsServerParseRulesSaving] = useState(false)
+  const [serverParseRulesError, setServerParseRulesError] = useState('')
+  const [structuredEventItems, setStructuredEventItems] = useState(createEmptyStructuredEventItems)
+  const [structuredEventLoading, setStructuredEventLoading] = useState(createEmptyStructuredEventLoading)
+  const [structuredEventErrors, setStructuredEventErrors] = useState(createEmptyStructuredEventErrors)
   const realtimeLogViewportRef = useRef(null)
   const selectedConfigFilePathRef = useRef('')
   const configFileDirtyRef = useRef(false)
@@ -727,6 +765,65 @@ function App() {
     }
   }
 
+  const loadServerParseRules = async (serverUuid) => {
+    setIsServerParseRulesLoading(true)
+    setServerParseRulesError('')
+
+    try {
+      const payload = await dashboardApi.getServerParseRules(serverUuid)
+      setServerParseRules(payload)
+      setServerParseRulesDraft(JSON.stringify(payload.rules ?? [], null, 2))
+      return payload
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '读取解析规则失败'
+      setServerParseRules({ version: null, rules: [], applied: false, message: '' })
+      setServerParseRulesDraft('[]')
+      setServerParseRulesError(message)
+      throw new Error(message)
+    } finally {
+      setIsServerParseRulesLoading(false)
+    }
+  }
+
+  const loadStructuredEvents = async (serverUuid, eventType) => {
+    setStructuredEventLoading((currentValue) => ({
+      ...currentValue,
+      [eventType]: true,
+    }))
+    setStructuredEventErrors((currentValue) => ({
+      ...currentValue,
+      [eventType]: '',
+    }))
+
+    try {
+      const payload = await dashboardApi.getServerParsedEvents(serverUuid, {
+        eventType,
+        limit: 50,
+      })
+      setStructuredEventItems((currentValue) => ({
+        ...currentValue,
+        [eventType]: buildStructuredEventItems(eventType, payload.items ?? []),
+      }))
+      return payload
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '读取结构化事件失败'
+      setStructuredEventItems((currentValue) => ({
+        ...currentValue,
+        [eventType]: [],
+      }))
+      setStructuredEventErrors((currentValue) => ({
+        ...currentValue,
+        [eventType]: message,
+      }))
+      throw new Error(message)
+    } finally {
+      setStructuredEventLoading((currentValue) => ({
+        ...currentValue,
+        [eventType]: false,
+      }))
+    }
+  }
+
   useEffect(() => {
     let cancelled = false
 
@@ -799,7 +896,13 @@ function App() {
     setConfigFileVersion('')
     setConfigFileError('')
     setConfigFileRefreshToken(0)
-  }, [managedServerDetail?.agentId, selectedServerUuid])
+    setServerParseRules({ version: null, rules: [], applied: false, message: '' })
+    setServerParseRulesDraft('[]')
+    setServerParseRulesError('')
+    setStructuredEventItems(createEmptyStructuredEventItems())
+    setStructuredEventLoading(createEmptyStructuredEventLoading())
+    setStructuredEventErrors(createEmptyStructuredEventErrors())
+  }, [selectedServerUuid])
 
   useEffect(() => {
     setServerAgentAuth(null)
@@ -810,7 +913,6 @@ function App() {
   const canAccessAgentWorkbench = canUseAgentWorkbench({
     hasKey: serverAgentAuth?.hasKey,
     agentOnline: managedServerDetail?.agentOnline,
-    agentId: managedServerDetail?.agentId,
   })
 
   useEffect(() => {
@@ -839,7 +941,7 @@ function App() {
 
     async function loadConfigTree() {
       try {
-        const payload = await dashboardApi.getAgentFileTree(managedServerDetail.agentId, rootPath)
+        const payload = await dashboardApi.getServerFileTree(selectedServerUuid, rootPath)
         if (cancelled) {
           return
         }
@@ -870,7 +972,7 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [activeView, canAccessAgentWorkbench, managedServerDetail?.agentId, managedServerDetail?.workspaceRoots, configFileRefreshToken])
+  }, [activeView, canAccessAgentWorkbench, selectedServerUuid, managedServerDetail?.workspaceRoots, configFileRefreshToken])
 
   useEffect(() => {
     if (activeView !== 'server-detail' || !canAccessAgentWorkbench || !selectedConfigFilePath) {
@@ -888,8 +990,8 @@ function App() {
       setConfigFileLoading(true)
 
       try {
-        const payload = await dashboardApi.getAgentFileContent(
-          managedServerDetail.agentId,
+        const payload = await dashboardApi.getServerFileContent(
+          selectedServerUuid,
           selectedConfigFilePath,
         )
         if (cancelled) {
@@ -921,7 +1023,43 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [activeView, canAccessAgentWorkbench, managedServerDetail?.agentId, selectedConfigFilePath, configFileItems, configFileRefreshToken])
+  }, [activeView, canAccessAgentWorkbench, selectedServerUuid, selectedConfigFilePath, configFileItems, configFileRefreshToken])
+
+  useEffect(() => {
+    if (activeView !== 'server-detail' || normalizedWorkbenchSection !== 'parse-rules' || !selectedServerUuid) {
+      return undefined
+    }
+
+    let cancelled = false
+
+    loadServerParseRules(selectedServerUuid).catch(() => {
+      if (cancelled) {
+        return
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeView, normalizedWorkbenchSection, selectedServerUuid])
+
+  useEffect(() => {
+    if (activeView !== 'server-detail' || !selectedServerUuid || !STRUCTURED_EVENT_TYPES.includes(normalizedWorkbenchSection)) {
+      return undefined
+    }
+
+    let cancelled = false
+
+    loadStructuredEvents(selectedServerUuid, normalizedWorkbenchSection).catch(() => {
+      if (cancelled) {
+        return
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeView, normalizedWorkbenchSection, selectedServerUuid])
 
   useEffect(() => {
     if (activeView !== 'server-detail' || !canAccessAgentWorkbench) {
@@ -931,7 +1069,7 @@ function App() {
     let eventSource
 
     try {
-      eventSource = dashboardApi.openAgentEvents(managedServerDetail.agentId)
+      eventSource = dashboardApi.openServerEvents(selectedServerUuid)
       setRealtimeLogConnectionLabel('连接中')
     } catch {
       setRealtimeLogConnectionLabel('当前环境不支持 SSE')
@@ -970,8 +1108,32 @@ function App() {
       }
     }
 
+    const handleParsedEvents = (event) => {
+      const normalizedEvent = normalizeAgentStreamEvent(event.type, event.data)
+      if (!normalizedEvent || normalizedEvent.type !== 'parsedEvents') {
+        return
+      }
+
+      setStructuredEventItems((currentValue) => {
+        const nextValue = { ...currentValue }
+
+        for (const eventItem of normalizedEvent.payload.events ?? []) {
+          const eventType = eventItem.eventType
+          if (!STRUCTURED_EVENT_TYPES.includes(eventType)) {
+            continue
+          }
+
+          const normalizedItems = buildStructuredEventItems(eventType, [eventItem])
+          nextValue[eventType] = [...normalizedItems, ...nextValue[eventType]].slice(0, 100)
+        }
+
+        return nextValue
+      })
+    }
+
     eventSource.addEventListener('agent.logChunk', handleLogChunk)
     eventSource.addEventListener('agent.fileChanged', handleFileChanged)
+    eventSource.addEventListener('agent.parsedEvents', handleParsedEvents)
     eventSource.onerror = () => {
       setRealtimeLogConnectionLabel('连接中断')
     }
@@ -979,7 +1141,7 @@ function App() {
     return () => {
       eventSource.close()
     }
-  }, [activeView, canAccessAgentWorkbench, managedServerDetail?.agentId, managedServerDetail?.name, realtimeLogPaused])
+  }, [activeView, canAccessAgentWorkbench, selectedServerUuid, managedServerDetail?.name, realtimeLogPaused])
 
   useEffect(() => {
     if (!realtimeLogAutoScroll || normalizedWorkbenchSection !== 'realtime-logs') {
@@ -1044,6 +1206,15 @@ function App() {
           setServerAgentAuth(auth)
           setServerAgentAuthError('')
           setServerDetailError('')
+          if (activeView === 'server-detail' && normalizedWorkbenchSection === 'parse-rules') {
+            await loadServerParseRules(selectedServerUuid)
+          }
+          if (
+            activeView === 'server-detail' &&
+            STRUCTURED_EVENT_TYPES.includes(normalizedWorkbenchSection)
+          ) {
+            await loadStructuredEvents(selectedServerUuid, normalizedWorkbenchSection)
+          }
         } catch (error) {
           const message = error instanceof Error ? error.message : '读取服务器详情失败，请稍后重试。'
           setManagedServerDetail(null)
@@ -1064,7 +1235,7 @@ function App() {
   }
 
   const handleSaveConfigFile = async () => {
-    if (!canAccessAgentWorkbench || !managedServerDetail?.agentId || !selectedConfigFilePath) {
+    if (!canAccessAgentWorkbench || !selectedServerUuid || !selectedConfigFilePath) {
       return
     }
 
@@ -1072,7 +1243,7 @@ function App() {
     setConfigFileError('')
 
     try {
-      const payload = await dashboardApi.updateAgentFileContent(managedServerDetail.agentId, {
+      const payload = await dashboardApi.updateServerFileContent(selectedServerUuid, {
         logicalPath: selectedConfigFilePath,
         content: configFileDraft,
         expectedVersion: configFileVersion || null,
@@ -1084,6 +1255,32 @@ function App() {
       setConfigFileError(error instanceof Error ? error.message : '保存配置文件失败')
     } finally {
       setConfigFileSaving(false)
+    }
+  }
+
+  const handleSaveParseRules = async () => {
+    if (!selectedServerUuid) {
+      return
+    }
+
+    setIsServerParseRulesSaving(true)
+    setServerParseRulesError('')
+
+    try {
+      const nextRules = JSON.parse(serverParseRulesDraft)
+      if (!Array.isArray(nextRules)) {
+        throw new Error('解析规则必须是 JSON 数组')
+      }
+
+      const payload = await dashboardApi.updateServerParseRules(selectedServerUuid, {
+        rules: nextRules,
+      })
+      setServerParseRules(payload)
+      setServerParseRulesDraft(JSON.stringify(payload.rules ?? [], null, 2))
+    } catch (error) {
+      setServerParseRulesError(error instanceof Error ? error.message : '保存解析规则失败')
+    } finally {
+      setIsServerParseRulesSaving(false)
     }
   }
 
@@ -1455,6 +1652,26 @@ function App() {
     const authStatusLabel = describeAgentAuthStatus(authAwareServer)
     const workbenchContent = createServerWorkbenchContent(detailServer)
     const sectionContent = workbenchContent[normalizedWorkbenchSection]
+    const currentStructuredItems = STRUCTURED_EVENT_TYPES.includes(normalizedWorkbenchSection)
+      ? structuredEventItems[normalizedWorkbenchSection] ?? []
+      : []
+    const currentStructuredLoading = STRUCTURED_EVENT_TYPES.includes(normalizedWorkbenchSection)
+      ? structuredEventLoading[normalizedWorkbenchSection] ?? false
+      : false
+    const currentStructuredError = STRUCTURED_EVENT_TYPES.includes(normalizedWorkbenchSection)
+      ? structuredEventErrors[normalizedWorkbenchSection] ?? ''
+      : ''
+    const structuredEventSourceLabel = canAccessAgentWorkbench ? '历史查询 + 实时增量' : '仅历史查询'
+    const latestStructuredEventTime = currentStructuredItems[0]?.time ?? '--'
+
+    const renderStructuredEventEmptyRow = (colSpan, message) => (
+      <tr>
+        <td colSpan={colSpan}>
+          <div className="workbench-log-empty">{message}</div>
+        </td>
+      </tr>
+    )
+
     const renderWorkbenchSection = () => {
       switch (normalizedWorkbenchSection) {
         case 'overview':
@@ -1644,6 +1861,78 @@ function App() {
               </div>
             </div>
           )
+        case 'parse-rules':
+          return (
+            <div className="workbench-stack">
+              <div className="workbench-metric-grid compact">
+                <div className="workbench-metric-card">
+                  <span className="workbench-metric-label">规则版本</span>
+                  <strong>{serverParseRules.version ?? '--'}</strong>
+                  <span className="workbench-metric-meta">按服务器独立维护</span>
+                </div>
+                <div className="workbench-metric-card">
+                  <span className="workbench-metric-label">热更新状态</span>
+                  <strong>{serverParseRules.applied ? '已下发' : '待生效'}</strong>
+                  <span className="workbench-metric-meta">
+                    {serverParseRules.agentOnline ? `在线 Agent：${serverParseRules.agentId ?? '--'}` : '当前无在线 Agent'}
+                  </span>
+                </div>
+                <div className="workbench-metric-card">
+                  <span className="workbench-metric-label">规则条数</span>
+                  <strong>{serverParseRules.rules?.length ?? 0}</strong>
+                  <span className="workbench-metric-meta">保存后会覆盖当前整组规则</span>
+                </div>
+              </div>
+              <div className="card">
+                <div className="card-header">
+                  <div>
+                    <div className="card-title">规则 JSON</div>
+                    <div className="card-subtitle">{sectionContent.subtitle}</div>
+                  </div>
+                </div>
+                {serverParseRules.message ? (
+                  <div className={`server-detail-banner${serverParseRules.applied ? '' : ' error'}`}>
+                    {serverParseRules.message}
+                  </div>
+                ) : null}
+                {serverParseRulesError ? <div className="form-error workbench-inline-error">{serverParseRulesError}</div> : null}
+                <textarea
+                  className="workbench-code-preview workbench-code-editor"
+                  value={serverParseRulesDraft}
+                  onChange={(event) => setServerParseRulesDraft(event.target.value)}
+                  placeholder={isServerParseRulesLoading ? '正在加载解析规则…' : '请输入 JSON 数组规则'}
+                  disabled={isServerParseRulesLoading || isServerParseRulesSaving}
+                />
+                <div className="workbench-log-command">
+                  <input
+                    type="text"
+                    value={`版本：${serverParseRules.version ?? '--'} · 状态：${serverParseRules.applied ? '已下发' : '待生效'} · Agent：${serverParseRules.agentOnline ? '在线' : '离线'}`}
+                    disabled
+                  />
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    type="button"
+                    onClick={() => {
+                      if (selectedServerUuid) {
+                        loadServerParseRules(selectedServerUuid).catch(() => {})
+                      }
+                    }}
+                    disabled={!selectedServerUuid || isServerParseRulesLoading || isServerParseRulesSaving}
+                  >
+                    {isServerParseRulesLoading ? '加载中…' : '重新加载'}
+                  </button>
+                  <button
+                    className="btn btn-primary btn-sm"
+                    type="button"
+                    onClick={handleSaveParseRules}
+                    disabled={!selectedServerUuid || isServerParseRulesLoading || isServerParseRulesSaving}
+                  >
+                    {isServerParseRulesSaving ? '保存中…' : '保存规则'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )
         case 'chat':
           return (
             <div className="workbench-stack">
@@ -1666,9 +1955,16 @@ function App() {
                 <div className="card-header">
                   <div>
                     <div className="card-title">聊天记录</div>
-                    <div className="card-subtitle">使用真实表格结构占位，后续直接接接口数据。</div>
+                    <div className="card-subtitle">历史记录由 backend 查询，在线时通过 SSE 追加新事件。</div>
                   </div>
                 </div>
+                <div className="workbench-inline-meta" style={{ marginBottom: '16px' }}>
+                  <span>数据源</span>
+                  <strong>{structuredEventSourceLabel}</strong>
+                  <span>最新事件</span>
+                  <strong>{latestStructuredEventTime}</strong>
+                </div>
+                {currentStructuredError ? <div className="form-error workbench-inline-error">{currentStructuredError}</div> : null}
                 <div className="workbench-table-wrap">
                   <table className="workbench-table">
                     <thead>
@@ -1680,14 +1976,18 @@ function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {sectionContent.rows.map((row) => (
-                        <tr key={`${row.time}-${row.player}`}>
-                          <td>{row.time}</td>
-                          <td>{row.player}</td>
-                          <td>{row.channel}</td>
-                          <td>{row.content}</td>
-                        </tr>
-                      ))}
+                      {currentStructuredLoading
+                        ? renderStructuredEventEmptyRow(4, '正在加载聊天结构化事件…')
+                        : currentStructuredItems.length > 0
+                          ? currentStructuredItems.map((row) => (
+                              <tr key={row.id}>
+                                <td>{row.time}</td>
+                                <td>{row.player}</td>
+                                <td>{row.channel}</td>
+                                <td>{row.content}</td>
+                              </tr>
+                            ))
+                          : renderStructuredEventEmptyRow(4, '暂无聊天结构化事件')}
                     </tbody>
                   </table>
                 </div>
@@ -1696,47 +1996,87 @@ function App() {
           )
         case 'flight':
           return (
-            <div className="workbench-card-grid">
-              {sectionContent.incidents.map((item) => (
-                <div className="card" key={`${item.player}-${item.area}`}>
-                  <div className="card-header">
-                    <div>
-                      <div className="card-title">{item.player}</div>
-                      <div className="card-subtitle">{item.area}</div>
-                    </div>
-                    <span className={`workbench-severity ${item.level === '高' ? 'high' : item.level === '中' ? 'medium' : 'low'}`}>
-                      {item.level}风险
-                    </span>
-                  </div>
-                  <div className="workbench-incident-body">
-                    <p>{item.detail}</p>
-                    <div className="workbench-inline-meta">
-                      <span>状态</span>
-                      <strong>{item.status}</strong>
-                    </div>
-                  </div>
+            <div className="workbench-stack">
+              <div className="workbench-metric-grid compact">
+                <div className="workbench-metric-card">
+                  <span className="workbench-metric-label">事件数量</span>
+                  <strong>{currentStructuredItems.length}</strong>
+                  <span className="workbench-metric-meta">最近 50 条历史记录</span>
                 </div>
-              ))}
+                <div className="workbench-metric-card">
+                  <span className="workbench-metric-label">数据源</span>
+                  <strong>{structuredEventSourceLabel}</strong>
+                  <span className="workbench-metric-meta">在线时自动追加</span>
+                </div>
+                <div className="workbench-metric-card">
+                  <span className="workbench-metric-label">最新事件</span>
+                  <strong>{latestStructuredEventTime}</strong>
+                  <span className="workbench-metric-meta">按时间倒序展示</span>
+                </div>
+              </div>
+              {currentStructuredError ? <div className="form-error workbench-inline-error">{currentStructuredError}</div> : null}
+              {currentStructuredLoading ? (
+                <div className="card">
+                  <div className="workbench-log-empty">正在加载飞天结构化事件…</div>
+                </div>
+              ) : currentStructuredItems.length > 0 ? (
+                <div className="workbench-card-grid">
+                  {currentStructuredItems.map((item) => (
+                    <div className="card" key={item.id}>
+                      <div className="card-header">
+                        <div>
+                          <div className="card-title">{item.player}</div>
+                          <div className="card-subtitle">{item.area}</div>
+                        </div>
+                        <span className={`workbench-severity ${item.level === '高' ? 'high' : item.level === '中' ? 'medium' : 'low'}`}>
+                          {item.level}风险
+                        </span>
+                      </div>
+                      <div className="workbench-incident-body">
+                        <p>{item.detail}</p>
+                        <div className="workbench-inline-meta">
+                          <span>状态</span>
+                          <strong>{item.status}</strong>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="card">
+                  <div className="workbench-log-empty">暂无飞天结构化事件</div>
+                </div>
+              )}
             </div>
           )
         case 'knockdown':
           return (
             <div className="workbench-stack">
               <div className="workbench-metric-grid compact">
-                {sectionContent.summary.map((item) => (
-                  <div className="workbench-metric-card" key={item.label}>
-                    <span className="workbench-metric-label">{item.label}</span>
-                    <strong>{item.value}</strong>
-                  </div>
-                ))}
+                <div className="workbench-metric-card">
+                  <span className="workbench-metric-label">事件数量</span>
+                  <strong>{currentStructuredItems.length}</strong>
+                  <span className="workbench-metric-meta">最近 50 条历史记录</span>
+                </div>
+                <div className="workbench-metric-card">
+                  <span className="workbench-metric-label">数据源</span>
+                  <strong>{structuredEventSourceLabel}</strong>
+                  <span className="workbench-metric-meta">在线时自动追加</span>
+                </div>
+                <div className="workbench-metric-card">
+                  <span className="workbench-metric-label">最新事件</span>
+                  <strong>{latestStructuredEventTime}</strong>
+                  <span className="workbench-metric-meta">按时间倒序展示</span>
+                </div>
               </div>
               <div className="card">
                 <div className="card-header">
                   <div>
                     <div className="card-title">击倒事件</div>
-                    <div className="card-subtitle">预留实时战斗记录和热点分析表格。</div>
+                    <div className="card-subtitle">历史记录由 backend 查询，在线时通过 SSE 追加新事件。</div>
                   </div>
                 </div>
+                {currentStructuredError ? <div className="form-error workbench-inline-error">{currentStructuredError}</div> : null}
                 <div className="workbench-table-wrap">
                   <table className="workbench-table">
                     <thead>
@@ -1749,15 +2089,19 @@ function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {sectionContent.rows.map((row) => (
-                        <tr key={`${row.time}-${row.attacker}-${row.defender}`}>
-                          <td>{row.time}</td>
-                          <td>{row.attacker}</td>
-                          <td>{row.defender}</td>
-                          <td>{row.weapon}</td>
-                          <td>{row.distance}</td>
-                        </tr>
-                      ))}
+                      {currentStructuredLoading
+                        ? renderStructuredEventEmptyRow(5, '正在加载击倒结构化事件…')
+                        : currentStructuredItems.length > 0
+                          ? currentStructuredItems.map((row) => (
+                              <tr key={row.id}>
+                                <td>{row.time}</td>
+                                <td>{row.attacker}</td>
+                                <td>{row.defender}</td>
+                                <td>{row.weapon}</td>
+                                <td>{row.distance}</td>
+                              </tr>
+                            ))
+                          : renderStructuredEventEmptyRow(5, '暂无击倒结构化事件')}
                     </tbody>
                   </table>
                 </div>
@@ -1768,31 +2112,47 @@ function App() {
           return (
             <div className="workbench-stack">
               <div className="workbench-metric-grid">
-                {sectionContent.cards.map((item) => (
-                  <div className="workbench-metric-card" key={item.title}>
-                    <span className="workbench-metric-label">{item.title}</span>
-                    <strong>{item.value}</strong>
-                    <span className="workbench-metric-meta">{item.sub}</span>
-                  </div>
-                ))}
+                <div className="workbench-metric-card">
+                  <span className="workbench-metric-label">事件数量</span>
+                  <strong>{currentStructuredItems.length}</strong>
+                  <span className="workbench-metric-meta">最近 50 条历史记录</span>
+                </div>
+                <div className="workbench-metric-card">
+                  <span className="workbench-metric-label">数据源</span>
+                  <strong>{structuredEventSourceLabel}</strong>
+                  <span className="workbench-metric-meta">在线时自动追加</span>
+                </div>
+                <div className="workbench-metric-card">
+                  <span className="workbench-metric-label">最新事件</span>
+                  <strong>{latestStructuredEventTime}</strong>
+                  <span className="workbench-metric-meta">按时间倒序展示</span>
+                </div>
               </div>
               <div className="card">
                 <div className="card-header">
                   <div>
                     <div className="card-title">赛程节点</div>
-                    <div className="card-subtitle">展示回合、赛段和运营准备项。</div>
+                    <div className="card-subtitle">结构化比赛事件按时间汇总展示。</div>
                   </div>
                 </div>
+                {currentStructuredError ? <div className="form-error workbench-inline-error">{currentStructuredError}</div> : null}
                 <div className="workbench-timeline">
-                  {sectionContent.timeline.map((item) => (
-                    <div className="workbench-timeline-item" key={item.title}>
-                      <div className="workbench-timeline-dot"></div>
-                      <div>
-                        <strong>{item.title}</strong>
-                        <p>{item.detail}</p>
+                  {currentStructuredLoading ? (
+                    <div className="workbench-log-empty">正在加载比赛结构化事件…</div>
+                  ) : currentStructuredItems.length > 0 ? (
+                    currentStructuredItems.map((item) => (
+                      <div className="workbench-timeline-item" key={item.id}>
+                        <div className="workbench-timeline-dot"></div>
+                        <div>
+                          <strong>{item.title}</strong>
+                          <p>{item.detail}</p>
+                          <span>{`${item.time} · ${item.result}`}</span>
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    ))
+                  ) : (
+                    <div className="workbench-log-empty">暂无比赛结构化事件</div>
+                  )}
                 </div>
               </div>
             </div>

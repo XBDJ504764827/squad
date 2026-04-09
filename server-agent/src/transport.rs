@@ -11,8 +11,8 @@ use tracing::warn;
 
 use crate::models::{
     AgentClientMessage, AgentCommand, AgentCommandResult, AgentError, AgentFileChanged,
-    AgentHeartbeat, AgentLogChunk, AgentRegistered, AgentRegistration, AgentServerMessage,
-    LogEnvelope,
+    AgentHeartbeat, AgentLogChunk, AgentParsedEvents, AgentRegistered, AgentRegistration,
+    AgentServerMessage, LogEnvelope, ParsedLogEvent,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -27,6 +27,10 @@ pub trait AgentCommandHandler {
     }
 
     fn drain_file_changes(&self) -> Result<Vec<AgentFileChanged>, AgentError> {
+        Ok(Vec::new())
+    }
+
+    fn drain_parsed_events(&self) -> Result<Vec<ParsedLogEvent>, AgentError> {
         Ok(Vec::new())
     }
 }
@@ -161,6 +165,13 @@ impl Transport {
                     for change in handler.drain_file_changes()? {
                         connection.send_file_changed(change).await?;
                     }
+
+                    let parsed_events = handler.drain_parsed_events()?;
+                    if !parsed_events.is_empty() {
+                        connection
+                            .send_parsed_events(AgentParsedEvents { events: parsed_events })
+                            .await?;
+                    }
                 }
                 message = connection.next_server_message() => {
                     match message? {
@@ -220,6 +231,11 @@ impl AgentConnection {
 
     pub async fn send_file_changed(&mut self, payload: AgentFileChanged) -> Result<(), AgentError> {
         self.send_message(&AgentClientMessage::FileChanged(payload))
+            .await
+    }
+
+    pub async fn send_parsed_events(&mut self, payload: AgentParsedEvents) -> Result<(), AgentError> {
+        self.send_message(&AgentClientMessage::ParsedEvents(payload))
             .await
     }
 

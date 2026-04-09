@@ -120,6 +120,11 @@ pub struct AgentFileChanged {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentParsedEvents {
+    pub events: Vec<ParsedLogEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedLogEvent {
     pub agent_id: String,
     pub rule_id: String,
@@ -233,6 +238,8 @@ pub enum AgentClientMessage {
     LogChunk(AgentLogChunk),
     #[serde(rename = "agent.fileChanged")]
     FileChanged(AgentFileChanged),
+    #[serde(rename = "agent.parsedEvents")]
+    ParsedEvents(AgentParsedEvents),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

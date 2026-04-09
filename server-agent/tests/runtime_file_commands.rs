@@ -2,11 +2,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use server_agent::file_watcher::FileWatcher;
 use server_agent::{
     runtime::RuntimeCommandHandler, AgentCommand, AgentCommandHandler, FileReadRequest,
     FileReadResult, FileService, FileServiceConfig, FileTreeEntry, FileTreeRequest, FileTreeResult,
-    FileWriteRequest, FileWriteResult, ParseRule, ParseRuleKind, PathPolicy,
-    ReplaceParseRulesRequest, ReplaceParseRulesResult, WorkspaceRootConfig,
+    FileWriteRequest, FileWriteResult, LogSourceConfig, LogStartPosition, LogTailer, ParseRule,
+    ParseRuleKind, PathPolicy, ReplaceParseRulesRequest, ReplaceParseRulesResult,
+    WorkspaceRootConfig,
 };
 
 fn make_temp_dir(prefix: &str) -> PathBuf {
@@ -41,6 +43,14 @@ fn make_rule(id: &str, pattern: &str, event_type: &str, severity: &str) -> Parse
         pattern: pattern.to_string(),
         event_type: event_type.to_string(),
         severity: severity.to_string(),
+    }
+}
+
+fn make_log_config(primary_path: &std::path::Path) -> LogSourceConfig {
+    LogSourceConfig {
+        primary_path: primary_path.to_path_buf(),
+        glob: None,
+        start_position: LogStartPosition::End,
     }
 }
 
@@ -184,4 +194,70 @@ fn invalid_replace_parse_rules_keeps_previous_rules_active() {
     }));
 
     assert!(result.is_err());
+}
+
+#[test]
+fn drain_log_entries_collects_and_clears_parsed_events() {
+    let tmp = make_temp_dir("runtime-parsed-events");
+    let workspace_root = tmp.join("workspace");
+    fs::create_dir_all(&workspace_root).expect("mkdir");
+    let log_path = workspace_root.join("server.log");
+    fs::write(&log_path, "").expect("write empty log");
+
+    let roots = vec![WorkspaceRootConfig {
+        name: "workspace".to_string(),
+        local_root: workspace_root.clone(),
+    }];
+    let path_policy = PathPolicy::new(&roots).expect("path policy");
+    let file_service = FileService::new(
+        path_policy.clone(),
+        FileServiceConfig {
+            max_file_size: 1024 * 1024,
+            allowed_extensions: Some(vec![".txt".to_string(), ".cfg".to_string()]),
+        },
+    );
+    let log_tailer =
+        LogTailer::new("agent-1", "server", make_log_config(&log_path)).expect("create tailer");
+    let file_watcher = FileWatcher::new(path_policy, &roots).expect("create file watcher");
+    let handler = RuntimeCommandHandler::with_streaming(
+        file_service,
+        vec![make_rule(
+            "chat",
+            r"^\[CHAT\] (?P<player>[^:]+): (?P<message>.+)$",
+            "chat",
+            "info",
+        )],
+        log_tailer,
+        file_watcher,
+    )
+    .expect("handler should build");
+
+    assert!(handler
+        .drain_log_entries()
+        .expect("initial drain should succeed")
+        .is_empty());
+
+    fs::write(&log_path, "[CHAT] RiverFox: hello squad\n").expect("append log line");
+
+    let log_entries = handler
+        .drain_log_entries()
+        .expect("drain log entries should succeed");
+    assert_eq!(log_entries.len(), 1);
+    assert_eq!(log_entries[0].raw_line, "[CHAT] RiverFox: hello squad");
+
+    let parsed_events = handler
+        .drain_parsed_events()
+        .expect("drain parsed events should succeed");
+    assert_eq!(parsed_events.len(), 1);
+    assert_eq!(parsed_events[0].event_type, "chat");
+    assert_eq!(parsed_events[0].payload.get("player"), Some(&"RiverFox".to_string()));
+    assert_eq!(
+        parsed_events[0].payload.get("message"),
+        Some(&"hello squad".to_string())
+    );
+
+    assert!(handler
+        .drain_parsed_events()
+        .expect("second drain should succeed")
+        .is_empty());
 }

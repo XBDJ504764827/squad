@@ -2,8 +2,9 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use server_agent::{
     AgentClientMessage, AgentCommand, AgentCommandHandler, AgentCommandResult, AgentFileChanged,
-    AgentHeartbeat, AgentLogChunk, AgentPlatform, AgentRegistered, AgentRegistration,
-    AgentServerMessage, LogEnvelope, Transport, WorkspaceRootSummary,
+    AgentHeartbeat, AgentLogChunk, AgentParsedEvents, AgentPlatform, AgentRegistered,
+    AgentRegistration, AgentServerMessage, LogEnvelope, ParsedLogEvent, Transport,
+    WorkspaceRootSummary,
 };
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -54,7 +55,8 @@ async fn connect_sends_registration_and_waits_for_registered_ack() {
             AgentClientMessage::Heartbeat(_)
             | AgentClientMessage::CommandResult(_)
             | AgentClientMessage::LogChunk(_)
-            | AgentClientMessage::FileChanged(_) => {
+            | AgentClientMessage::FileChanged(_)
+            | AgentClientMessage::ParsedEvents(_) => {
                 panic!("unexpected message before registration ack")
             }
         }
@@ -369,6 +371,85 @@ async fn connection_can_send_file_change_after_registration() {
         })
         .await
         .expect("file change should send");
+
+    server.await.expect("server should finish");
+}
+
+#[tokio::test]
+async fn connection_can_send_parsed_events_after_registration() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("local addr");
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut socket = accept_async(stream).await.expect("upgrade");
+
+        let _ = socket
+            .next()
+            .await
+            .expect("register frame")
+            .expect("register frame readable");
+
+        let ack = AgentRegistered {
+            agent_id: "agent-1".to_string(),
+            session_id: "session-1".to_string(),
+        };
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&AgentServerMessage::Registered(ack))
+                    .expect("ack json")
+                    .into(),
+            ))
+            .await
+            .expect("ack should send");
+
+        let parsed = socket
+            .next()
+            .await
+            .expect("parsed frame")
+            .expect("parsed readable");
+        let message = serde_json::from_str::<AgentClientMessage>(
+            parsed.into_text().expect("parsed text").as_ref(),
+        )
+        .expect("parsed json");
+
+        match message {
+            AgentClientMessage::ParsedEvents(payload) => {
+                assert_eq!(payload.events.len(), 1);
+                assert_eq!(payload.events[0].event_type, "chat");
+                assert_eq!(payload.events[0].payload.get("player"), Some(&"RiverFox".to_string()));
+            }
+            other => panic!("unexpected client message: {other:?}"),
+        }
+    });
+
+    let transport = Transport::new(format!("ws://{address}"));
+    let mut connection = transport
+        .connect(make_registration())
+        .await
+        .expect("handshake should succeed");
+    connection
+        .send_parsed_events(AgentParsedEvents {
+            events: vec![ParsedLogEvent {
+                agent_id: "agent-1".to_string(),
+                rule_id: "chat-line".to_string(),
+                event_type: "chat".to_string(),
+                severity: "info".to_string(),
+                source: "server".to_string(),
+                cursor: "10".to_string(),
+                line_number: 10,
+                raw_line: "[CHAT] RiverFox: hello".to_string(),
+                observed_at: "1710000000000".to_string(),
+                payload: std::collections::BTreeMap::from([
+                    ("player".to_string(), "RiverFox".to_string()),
+                    ("message".to_string(), "hello".to_string()),
+                ]),
+            }],
+        })
+        .await
+        .expect("parsed events should send");
 
     server.await.expect("server should finish");
 }

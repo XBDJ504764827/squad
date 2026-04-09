@@ -102,6 +102,21 @@ pub async fn serve(mut socket: WebSocket, registry: AgentRegistry, db: PgPool) {
                                     )
                                     .await;
                             }
+                            AgentClientMessage::ParsedEvents(payload) => {
+                                let _ = crate::insert_server_parsed_events(
+                                    &db,
+                                    &registration.server_uuid,
+                                    &payload.events,
+                                )
+                                .await;
+                                registry
+                                    .broadcast_event(
+                                        &agent_id,
+                                        &session_id,
+                                        crate::models::AgentStreamEvent::ParsedEvents(payload),
+                                    )
+                                    .await;
+                            }
                             AgentClientMessage::Register(_) => break,
                         }
                     }
@@ -161,7 +176,8 @@ async fn read_registration(
         AgentClientMessage::Heartbeat(_)
         | AgentClientMessage::CommandResult(_)
         | AgentClientMessage::LogChunk(_)
-        | AgentClientMessage::FileChanged(_) => {
+        | AgentClientMessage::FileChanged(_)
+        | AgentClientMessage::ParsedEvents(_) => {
             return Err("first frame must be agent.register".to_string());
         }
     };

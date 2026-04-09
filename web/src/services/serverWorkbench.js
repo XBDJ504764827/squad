@@ -4,6 +4,7 @@ export const SERVER_WORKBENCH_SECTIONS = [
   { id: 'overview', label: '概要', icon: 'grid', description: '查看服务器总览、关键指标和近期状态。' },
   { id: 'control', label: '控制面板', icon: 'sliders', description: '预览运维动作、节点控制和发布操作。' },
   { id: 'realtime-logs', label: '实时日志', icon: 'terminal', description: '查看游戏服务器控制台日志的实时流式面板。' },
+  { id: 'parse-rules', label: '解析规则', icon: 'radar', description: '管理每台服务器独立的日志解析规则。' },
   { id: 'chat', label: '聊天记录', icon: 'messages', description: '查看游戏内聊天频道、过滤和会话概览。' },
   { id: 'flight', label: '飞天记录', icon: 'radar', description: '查看飞天告警、风险等级和处理状态。' },
   { id: 'knockdown', label: '击倒记录', icon: 'crosshair', description: '查看击倒事件、战斗热点和异常趋势。' },
@@ -22,7 +23,7 @@ export function normalizeWorkbenchSection(sectionId) {
 }
 
 export function canUseAgentWorkbench(server) {
-  return Boolean(server?.hasKey && server?.agentOnline && server?.agentId)
+  return Boolean(server?.hasKey && server?.agentOnline)
 }
 
 export function describeAgentAuthStatus(server) {
@@ -104,6 +105,28 @@ export function normalizeAgentStreamEvent(eventType, rawData) {
     }
   }
 
+  if (eventType === 'agent.parsedEvents') {
+    return {
+      type: 'parsedEvents',
+      payload: {
+        events: Array.isArray(payload?.events)
+          ? payload.events.map((event) => ({
+              agentId: event.agentId ?? event.agent_id ?? '',
+              ruleId: event.ruleId ?? event.rule_id ?? '',
+              eventType: event.eventType ?? event.event_type ?? '',
+              severity: event.severity ?? '',
+              source: event.source ?? '',
+              cursor: event.cursor ?? '',
+              lineNumber: event.lineNumber ?? event.line_number ?? 0,
+              rawLine: event.rawLine ?? event.raw_line ?? '',
+              observedAt: event.observedAt ?? event.observed_at ?? '',
+              payload: event.payload ?? {},
+            }))
+          : [],
+      },
+    }
+  }
+
   return null
 }
 
@@ -178,6 +201,78 @@ export function buildConfigFileItems(entries) {
   })
 }
 
+function formatStructuredEventTime(observedAt) {
+  return formatObservedAt(observedAt)
+}
+
+function normalizeSeverityLabel(severity) {
+  const normalized = String(severity ?? '').toLowerCase()
+  if (normalized === 'warn' || normalized === 'warning') {
+    return '中'
+  }
+  if (normalized === 'error' || normalized === 'critical') {
+    return '高'
+  }
+  return '低'
+}
+
+export function buildStructuredEventItems(eventType, events) {
+  return events.map((event, index) => {
+    const payload = event.payload ?? {}
+    const id = `${event.cursor ?? 'cursor'}-${event.lineNumber ?? index}`
+    const time = formatStructuredEventTime(event.observedAt)
+
+    if (eventType === 'chat') {
+      return {
+        id,
+        time,
+        player: payload.player ?? '--',
+        channel: payload.channel ?? '未标注频道',
+        content: payload.message ?? event.rawLine ?? '',
+      }
+    }
+
+    if (eventType === 'flight') {
+      return {
+        id,
+        time,
+        level: normalizeSeverityLabel(event.severity),
+        area: payload.area ?? payload.region ?? '--',
+        player: payload.player ?? payload.target ?? '--',
+        detail: payload.detail ?? payload.reason ?? event.rawLine ?? '',
+        status: payload.status ?? '待处理',
+      }
+    }
+
+    if (eventType === 'knockdown') {
+      return {
+        id,
+        time,
+        attacker: payload.attacker ?? payload.killer ?? '--',
+        defender: payload.defender ?? payload.victim ?? '--',
+        weapon: payload.weapon ?? '--',
+        distance: payload.distance ?? '--',
+      }
+    }
+
+    if (eventType === 'match') {
+      return {
+        id,
+        time,
+        title: payload.title ?? payload.round ?? payload.match ?? '比赛事件',
+        detail: payload.detail ?? payload.summary ?? event.rawLine ?? '',
+        result: payload.result ?? payload.status ?? '--',
+      }
+    }
+
+    return {
+      id,
+      time,
+      detail: event.rawLine ?? '',
+    }
+  })
+}
+
 export function createServerWorkbenchContent(server) {
   const serverName = server?.name ?? '未命名服务器'
   const serverUuid = server?.serverUuid ?? '--'
@@ -230,6 +325,10 @@ export function createServerWorkbenchContent(server) {
       streamName: `${serverName}-console`,
       levelOptions: ['ALL', 'INFO', 'SYSTEM', 'CHAT', 'WARN', 'ERROR'],
       commandPlaceholder: '后续接入控制台命令输入',
+    },
+    'parse-rules': {
+      title: '解析规则',
+      subtitle: '编辑并保存当前服务器的日志解析规则，在线时会自动热更新到 agent。',
     },
     chat: {
       filters: ['全部频道', '世界频道', '队伍频道', '系统广播'],

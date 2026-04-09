@@ -5,6 +5,7 @@ import {
   SERVER_WORKBENCH_SECTIONS,
   appendAgentLogChunk,
   appendRealtimeLogEntry,
+  buildStructuredEventItems,
   buildConfigFileItems,
   canUseAgentWorkbench,
   createInitialRealtimeLogs,
@@ -21,6 +22,7 @@ test('SERVER_WORKBENCH_SECTIONS contains all expected management modules', () =>
       'overview',
       'control',
       'realtime-logs',
+      'parse-rules',
       'chat',
       'flight',
       'knockdown',
@@ -60,7 +62,7 @@ test('filterRealtimeLogEntries filters by level and search term', () => {
   assert.equal(filterRealtimeLogEntries(logs, { level: 'ALL', searchTerm: 'boot' }).length, 1)
 })
 
-test('normalizeAgentStreamEvent parses log chunk and file change payloads', () => {
+test('normalizeAgentStreamEvent parses log chunk, file change and parsed event payloads', () => {
   const logEvent = normalizeAgentStreamEvent('agent.logChunk', JSON.stringify({
     entries: [
       {
@@ -76,11 +78,33 @@ test('normalizeAgentStreamEvent parses log chunk and file change payloads', () =
   const fileEvent = normalizeAgentStreamEvent('agent.fileChanged', JSON.stringify({
     logical_path: '/game-root/server.cfg',
   }))
+  const parsedEvent = normalizeAgentStreamEvent('agent.parsedEvents', JSON.stringify({
+    events: [
+      {
+        agent_id: 'agent-1',
+        rule_id: 'chat-line',
+        event_type: 'chat',
+        severity: 'info',
+        source: 'server',
+        cursor: '10',
+        line_number: 10,
+        raw_line: '[CHAT] RiverFox: hello',
+        observed_at: '1710000000000',
+        payload: {
+          player: 'RiverFox',
+          message: 'hello',
+        },
+      },
+    ],
+  }))
 
   assert.equal(logEvent.type, 'logChunk')
   assert.equal(logEvent.payload.entries[0].raw_line, '[WARN] high ping')
   assert.equal(fileEvent.type, 'fileChanged')
   assert.equal(fileEvent.payload.logicalPath, '/game-root/server.cfg')
+  assert.equal(parsedEvent.type, 'parsedEvents')
+  assert.equal(parsedEvent.payload.events[0].eventType, 'chat')
+  assert.equal(parsedEvent.payload.events[0].payload.player, 'RiverFox')
 })
 
 test('appendAgentLogChunk converts backend log envelopes into workbench log rows', () => {
@@ -115,11 +139,60 @@ test('buildConfigFileItems keeps files and folders in a stable workbench shape',
   assert.equal(items[1].sizeLabel, '128 B')
 })
 
+test('buildStructuredEventItems maps parsed events into section-specific rows', () => {
+  const events = [
+    {
+      cursor: '10',
+      lineNumber: 10,
+      eventType: 'chat',
+      severity: 'info',
+      observedAt: '1710000000000',
+      rawLine: '[CHAT] RiverFox: hello',
+      payload: {
+        player: 'RiverFox',
+        message: 'hello',
+        channel: '世界频道',
+      },
+    },
+  ]
+
+  const items = buildStructuredEventItems('chat', events)
+  assert.equal(items.length, 1)
+  assert.equal(items[0].player, 'RiverFox')
+  assert.equal(items[0].channel, '世界频道')
+  assert.equal(items[0].content, 'hello')
+})
+
+test('buildStructuredEventItems keeps observed time for flight events', () => {
+  const events = [
+    {
+      cursor: '11',
+      lineNumber: 11,
+      eventType: 'flight',
+      severity: 'warn',
+      observedAt: '1710000000000',
+      rawLine: '[FLIGHT] NightScout suspicious movement',
+      payload: {
+        player: 'NightScout',
+        area: '矿山上空',
+        detail: '连续跨地形跳跃',
+        status: '待复核',
+      },
+    },
+  ]
+
+  const items = buildStructuredEventItems('flight', events)
+  assert.equal(items.length, 1)
+  assert.equal(items[0].player, 'NightScout')
+  assert.equal(items[0].area, '矿山上空')
+  assert.equal(typeof items[0].time, 'string')
+  assert.notEqual(items[0].time, '--:--:--')
+})
+
 test('canUseAgentWorkbench only allows access when key exists and agent is online', () => {
-  assert.equal(canUseAgentWorkbench({ hasKey: false, agentOnline: false, agentId: null }), false)
-  assert.equal(canUseAgentWorkbench({ hasKey: true, agentOnline: false, agentId: 'agent-1' }), false)
-  assert.equal(canUseAgentWorkbench({ hasKey: true, agentOnline: true, agentId: '' }), false)
-  assert.equal(canUseAgentWorkbench({ hasKey: true, agentOnline: true, agentId: 'agent-1' }), true)
+  assert.equal(canUseAgentWorkbench({ hasKey: false, agentOnline: false }), false)
+  assert.equal(canUseAgentWorkbench({ hasKey: true, agentOnline: false }), false)
+  assert.equal(canUseAgentWorkbench({ hasKey: true, agentOnline: true }), true)
 })
 
 test('describeAgentAuthStatus returns user-facing auth state labels', () => {

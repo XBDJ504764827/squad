@@ -14,10 +14,10 @@ pub use log_parser::LogParser;
 pub use log_tail::LogTailer;
 pub use models::{
     AgentClientMessage, AgentCommand, AgentCommandEnvelope, AgentCommandResult, AgentError,
-    AgentFileChanged, AgentHeartbeat, AgentLogChunk, AgentPlatform, AgentRegistered,
-    AgentRegistration, AgentServerMessage, FileReadRequest, FileReadResult, FileTreeEntry,
-    FileTreeRequest, FileTreeResult, FileWriteRequest, FileWriteResult, LogEnvelope,
-    LogSourceConfig, LogStartPosition, ParseRule, ParseRuleKind, ParsedLogEvent,
+    AgentFileChanged, AgentHeartbeat, AgentLogChunk, AgentParsedEvents, AgentPlatform,
+    AgentRegistered, AgentRegistration, AgentServerMessage, FileReadRequest, FileReadResult,
+    FileTreeEntry, FileTreeRequest, FileTreeResult, FileWriteRequest, FileWriteResult,
+    LogEnvelope, LogSourceConfig, LogStartPosition, ParseRule, ParseRuleKind, ParsedLogEvent,
     ReadFileResult, ReplaceParseRulesRequest, ReplaceParseRulesResult, WorkspaceRootSummary,
     WriteFileResult,
 };

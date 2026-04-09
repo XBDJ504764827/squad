@@ -7,8 +7,8 @@ use crate::file_watcher::FileWatcher;
 use crate::{
     AgentCommand, AgentCommandHandler, AgentConfig, AgentError, AgentFileChanged,
     AgentRegistration, FileReadResult, FileService, FileTreeResult, FileWriteResult, LogEnvelope,
-    LogParser, LogTailer, ParseRule, PathPolicy, ReplaceParseRulesResult, Transport,
-    WorkspaceRootSummary,
+    LogParser, LogTailer, ParseRule, ParsedLogEvent, PathPolicy, ReplaceParseRulesResult,
+    Transport, WorkspaceRootSummary,
 };
 
 pub async fn run(config: AgentConfig) -> Result<()> {
@@ -59,6 +59,7 @@ pub async fn run(config: AgentConfig) -> Result<()> {
 pub struct RuntimeCommandHandler {
     file_service: FileService,
     log_parser: Mutex<LogParser>,
+    parsed_events: Mutex<Vec<ParsedLogEvent>>,
     log_tailer: Option<Mutex<LogTailer>>,
     file_watcher: Option<Mutex<FileWatcher>>,
 }
@@ -68,6 +69,7 @@ impl RuntimeCommandHandler {
         Self {
             file_service,
             log_parser: Mutex::new(LogParser::new(Vec::new()).expect("empty parse rules should compile")),
+            parsed_events: Mutex::new(Vec::new()),
             log_tailer: None,
             file_watcher: None,
         }
@@ -77,6 +79,7 @@ impl RuntimeCommandHandler {
         Ok(Self {
             file_service,
             log_parser: Mutex::new(LogParser::new(parse_rules)?),
+            parsed_events: Mutex::new(Vec::new()),
             log_tailer: None,
             file_watcher: None,
         })
@@ -91,6 +94,7 @@ impl RuntimeCommandHandler {
         Ok(Self {
             file_service,
             log_parser: Mutex::new(LogParser::new(parse_rules)?),
+            parsed_events: Mutex::new(Vec::new()),
             log_tailer: Some(Mutex::new(log_tailer)),
             file_watcher: Some(Mutex::new(file_watcher)),
         })
@@ -159,10 +163,33 @@ impl AgentCommandHandler for RuntimeCommandHandler {
             return Ok(Vec::new());
         };
 
-        log_tailer
+        let entries = log_tailer
             .lock()
             .map_err(|_| AgentError::Runtime("failed to lock log tailer".to_string()))?
-            .poll()
+            .poll()?;
+
+        if entries.is_empty() {
+            return Ok(entries);
+        }
+
+        let parser = self
+            .log_parser
+            .lock()
+            .map_err(|_| AgentError::Runtime("failed to lock log parser".to_string()))?;
+        let parsed = entries
+            .iter()
+            .filter_map(|entry| parser.parse(entry))
+            .collect::<Vec<_>>();
+        drop(parser);
+
+        if !parsed.is_empty() {
+            self.parsed_events
+                .lock()
+                .map_err(|_| AgentError::Runtime("failed to lock parsed events".to_string()))?
+                .extend(parsed);
+        }
+
+        Ok(entries)
     }
 
     fn drain_file_changes(&self) -> Result<Vec<AgentFileChanged>, AgentError> {
@@ -174,5 +201,13 @@ impl AgentCommandHandler for RuntimeCommandHandler {
             .lock()
             .map_err(|_| AgentError::Runtime("failed to lock file watcher".to_string()))?
             .poll_changes()
+    }
+
+    fn drain_parsed_events(&self) -> Result<Vec<ParsedLogEvent>, AgentError> {
+        let mut guard = self
+            .parsed_events
+            .lock()
+            .map_err(|_| AgentError::Runtime("failed to lock parsed events".to_string()))?;
+        Ok(std::mem::take(&mut *guard))
     }
 }
